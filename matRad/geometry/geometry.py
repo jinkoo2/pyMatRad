@@ -141,7 +141,7 @@ def cube_index_to_world_coords(cube_ix: np.ndarray, grid_struct: dict) -> np.nda
     if is_linear:
         # Linear indices -> subscript
         cube_ix = cube_ix.ravel()
-        Ny, Nx, Nz = dims[0], dims[1], dims[2]
+        Ny, Nx, Nz = int(dims[0]), int(dims[1]), int(dims[2])  # ensure native int (avoids uint8 overflow)
         # MATLAB-style linear index: col-major (Fortran-order), 1-based
         # ix = i + (j-1)*Ny + (k-1)*Ny*Nx  (MATLAB 1-based i, j, k)
         # Convert to 0-based Python first
@@ -263,7 +263,7 @@ def linear_index_to_subscript(lin_ix: np.ndarray, dims: tuple) -> np.ndarray:
     np.ndarray (N, 3), 0-based [i, j, k]
     """
     lin_ix = np.asarray(lin_ix, dtype=np.int64) - 1  # convert to 0-based
-    Ny, Nx, Nz = dims
+    Ny, Nx, Nz = int(dims[0]), int(dims[1]), int(dims[2])  # ensure native int (avoids uint8 overflow)
     k = lin_ix // (Ny * Nx)
     rem = lin_ix % (Ny * Nx)
     j = rem // Ny
@@ -284,7 +284,7 @@ def subscript_to_linear_index(ijk: np.ndarray, dims: tuple) -> np.ndarray:
     -------
     np.ndarray (N,), 1-based MATLAB linear indices
     """
-    Ny, Nx, Nz = dims
+    Ny, Nx, Nz = int(dims[0]), int(dims[1]), int(dims[2])  # ensure native int (avoids uint8 overflow)
     ijk = np.asarray(ijk)
     i = ijk[:, 0]
     j = ijk[:, 1]
@@ -357,11 +357,20 @@ def get_iso_center(cst: list, ct: dict, vis_bool: bool = False) -> np.ndarray:
     from ..config import MatRad_Config
     cfg = MatRad_Config.instance()
 
+    def _obj_is_empty(obj):
+        """Return True if objectives field is empty/None."""
+        if obj is None:
+            return True
+        try:
+            return len(obj) == 0
+        except TypeError:
+            return False  # mat_struct or similar — treat as non-empty
+
     # Check if any objectives are defined
     no_obj_or_const = True
     if len(cst[0]) >= 6:
         no_obj_or_const = all(
-            (len(row) < 6 or row[5] is None or len(row[5]) == 0)
+            (len(row) < 6 or _obj_is_empty(row[5]))
             for row in cst
         )
 
@@ -370,7 +379,7 @@ def get_iso_center(cst: list, ct: dict, vis_bool: bool = False) -> np.ndarray:
     for row in cst:
         voi_type = row[2]
         voi_indices = row[3][0] if isinstance(row[3], list) else row[3]
-        has_obj = len(row) >= 6 and row[5] is not None and len(row[5]) > 0
+        has_obj = len(row) >= 6 and not _obj_is_empty(row[5])
 
         if voi_type == "TARGET" and (no_obj_or_const or has_obj):
             all_target_voxels.append(np.asarray(voi_indices))

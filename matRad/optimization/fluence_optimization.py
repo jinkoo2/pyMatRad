@@ -86,6 +86,26 @@ def fluence_optimization(dij: dict, cst: list, pln: dict) -> dict:
     return result
 
 
+def _obj_is_empty(obj):
+    """Return True if objectives field is empty/None."""
+    if obj is None:
+        return True
+    try:
+        return len(obj) == 0
+    except TypeError:
+        return False  # mat_struct or similar — treat as non-empty
+
+
+def _wrap_objectives(obj_field):
+    """Wrap a single mat_struct (or other non-list) objective in a list."""
+    if obj_field is None:
+        return []
+    if isinstance(obj_field, (list, np.ndarray)):
+        return list(obj_field)
+    # Single mat_struct or dict — wrap in list
+    return [obj_field]
+
+
 def _initialize_weights(
     cst_dose: list,
     D_mat: sp.spmatrix,
@@ -99,17 +119,18 @@ def _initialize_weights(
     # Find reference doses from objectives
     ref_doses = []
     for row in cst_dose:
-        if len(row) < 6 or not row[5]:
+        if len(row) < 6 or _obj_is_empty(row[5]):
             continue
-        for obj in row[5]:
+        for obj in _wrap_objectives(row[5]):
             if isinstance(obj, dict):
                 params = obj.get("parameters", [])
-                if params and params[0] > 0:
-                    ref_doses.append(float(params[0]) / num_fractions)
+                if params and float(params[0] if hasattr(params, '__len__') else params) > 0:
+                    ref_doses.append(float(params[0] if hasattr(params, '__len__') else params) / num_fractions)
             elif hasattr(obj, "parameters"):
                 params = obj.parameters
-                if params and params[0] > 0:
-                    ref_doses.append(float(params[0]) / num_fractions)
+                p0 = float(params[0] if hasattr(params, '__len__') else params)
+                if p0 > 0:
+                    ref_doses.append(p0 / num_fractions)
 
     if ref_doses:
         target_dose = np.mean(ref_doses)
@@ -141,7 +162,7 @@ def _collect_objectives(
 
     objectives = []
     for row_idx, row in enumerate(cst_dose):
-        if len(row) < 6 or not row[5]:
+        if len(row) < 6 or _obj_is_empty(row[5]):
             continue
 
         vox_list = row[3]
@@ -150,12 +171,14 @@ def _collect_objectives(
         else:
             vox_ix = np.asarray(vox_list, dtype=np.int64) - 1
 
-        for obj in row[5]:
+        for obj in _wrap_objectives(row[5]):
             if obj is None:
                 continue
-            # Convert to DoseObjective if it's a dict
+            # Convert to DoseObjective if it's a dict or mat_struct
             if isinstance(obj, dict):
                 obj = _dict_to_objective(obj, num_fractions)
+            elif hasattr(obj, '_fieldnames'):
+                obj = _matstruct_to_objective(obj, num_fractions)
 
             if obj is not None:
                 objectives.append({
@@ -194,6 +217,39 @@ def _dict_to_objective(obj_dict: dict, num_fractions: int):
     if not params:
         params = [60.0]
     d_ref = float(params[0]) / num_fractions
+
+    return ObjClass(penalty=penalty, d_ref=d_ref)
+
+
+def _matstruct_to_objective(obj_struct, num_fractions: int):
+    """Convert a scipy.io mat_struct objective to a DoseObjective instance."""
+    from .DoseObjectives.objectives import (
+        SquaredDeviation, SquaredOverdosing, SquaredUnderdosing, MeanDose
+    )
+
+    class_map = {
+        "DoseObjectives.matRad_SquaredDeviation": SquaredDeviation,
+        "matRad_SquaredDeviation": SquaredDeviation,
+        "SquaredDeviation": SquaredDeviation,
+        "DoseObjectives.matRad_SquaredOverdosing": SquaredOverdosing,
+        "matRad_SquaredOverdosing": SquaredOverdosing,
+        "SquaredOverdosing": SquaredOverdosing,
+        "DoseObjectives.matRad_SquaredUnderdosing": SquaredUnderdosing,
+        "matRad_SquaredUnderdosing": SquaredUnderdosing,
+        "SquaredUnderdosing": SquaredUnderdosing,
+        "DoseObjectives.matRad_MeanDose": MeanDose,
+        "matRad_MeanDose": MeanDose,
+        "MeanDose": MeanDose,
+    }
+
+    class_name = str(getattr(obj_struct, "className", "SquaredDeviation"))
+    ObjClass = class_map.get(class_name, SquaredDeviation)
+
+    penalty = float(getattr(obj_struct, "penalty", 1.0))
+    params = getattr(obj_struct, "parameters", 60.0)
+    # parameters may be a scalar float or an array
+    p0 = float(params[0] if hasattr(params, '__len__') else params)
+    d_ref = p0 / num_fractions
 
     return ObjClass(penalty=penalty, d_ref=d_ref)
 
@@ -265,7 +321,7 @@ def _run_optimization(
         bounds=bounds,
         callback=callback,
         options={
-            "maxiter": 500,
+            "maxiter": 1000,
             "ftol": 1e-9,
             "gtol": 1e-6,
             "disp": False,

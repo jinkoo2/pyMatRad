@@ -192,8 +192,10 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
         """
         ct = get_world_axes(ct)
 
-        # If cube already exists (pre-computed), use it
+        # If cube already exists (pre-computed), use it — ensure it's a list
         if "cube" in ct and ct["cube"] is not None:
+            if not isinstance(ct["cube"], list):
+                ct["cube"] = [np.asarray(ct["cube"])]
             return ct
 
         # Convert HU to relative electron density
@@ -326,7 +328,7 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
             iso_cube = world_to_cube_coords(np.atleast_2d(iso_world), ct)[0]
 
             # Use first CT scenario for SSD
-            cube = self._cube_wed[0] if self._cube_wed else ct["cube"][0]
+            cube = self._cube_wed[0] if (isinstance(self._cube_wed, list) and len(self._cube_wed) > 0) else ct["cube"][0]
 
             ray_pos_bev = []
             ssd_values = []
@@ -486,7 +488,7 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
                     np.asarray(self.machine["data"].get("betas", [0.04, 0.15, 0.60])).ravel(),
                     interp_kernels,
                     rad_depths[vox_ix],
-                    geo_dists[vox_ix] + float(SAD),  # total geo dist from source
+                    geo_dists[vox_ix],  # geometric distance from source
                     iso_lat_x[vox_ix] - ray_pos_bev[0],
                     iso_lat_z[vox_ix] - ray_pos_bev[2],
                     self.ignore_invalid_values,

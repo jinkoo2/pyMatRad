@@ -1,6 +1,6 @@
 # pyMatRad Development Progress
 
-## Status: In Progress (partially working, needs testing on better hardware)
+## Status: Example 1 ✅ verified. Example 2 ✅ runs end-to-end (TG119, 2026-03-20).
 
 ---
 
@@ -70,14 +70,68 @@ nearest_dist, nearest_ray = tree.query(proj_2d, k=1, workers=-1)
 
 Also vectorized the cumulative radiological depth computation using `np.searchsorted` + `np.cumsum`.
 
+### 4. Geometric Distance Double-Counting (4× Dose Underestimate)
+**Problem**: In `photon_svd_engine.py` `_calc_dose`, the geometric distance was passed as `geo_dists[vox_ix] + float(SAD)`. But `geo_dists` is already computed as `sqrt(sum((vox_bev - source_bev)^2))` — the distance from source. Adding `SAD` again doubled the denominator, making the inverse-square correction `(SAD/(geo+SAD))^2 ≈ (1/2)^2 = 0.25` — a 4× underestimate.
+
+**Fix** (in `matRad/doseCalc/DoseEngines/photon_svd_engine.py` line ~489):
+```python
+geo_dists[vox_ix],  # NOT + float(SAD)
+```
+
+**Verification**: `compare_matlab.py` shows max dose error **0.72%** vs MATLAB `photons_testData.mat`.
+
+### 5. Plan Analysis Grid Mismatch (D_95=0 for all structures)
+**Problem**: `plan_analysis` used CT-grid voxel indices (1-based MATLAB linear) to index into a dose-grid cube. When dose grid resolution differs from CT (e.g., 3mm dose vs 2mm CT in example1), target voxel indices exceed the dose cube size and are filtered out, giving D_mean=0, D_95=0.
+
+**Fix** (in `matRad/planAnalysis/plan_analysis.py`):
+```python
+if dose_grid is not None:
+    from ..geometry.geometry import resize_cst_to_grid
+    cst = resize_cst_to_grid(cst, ct, dose_grid)
+```
+
+### 6. Matplotlib Deprecated `get_cmap` API
+**Fix**: Replaced `plt.cm.get_cmap("tab10")` with `plt.colormaps["tab10"]` in `example1_phantom.py`, `example2_photons.py`, and `gui/matrad_gui.py`.
+
+### 7. Output path `/tmp/` not portable on Windows
+**Fix**: Replaced `/tmp/pyMatRad_example1.png` and `/tmp/pyMatRad_example2.png` with `os.path.join(os.path.dirname(__file__), "pyMatRad_example1.png")`.
+
+### 8. uint8 Overflow in Geometry Dimension Arithmetic (TG119)
+**Problem**: TG119's `ct.cubeDim = [167, 167, 129]` is stored as uint8 in the .mat file. When scipy.io loads it, the dtype is uint8. `np.uint8(167) * np.uint8(167) = 27889` which overflows uint8 (max 255), giving 241. This caused the z-index `k = lin_ix // 241` to be ~5606 (out of bounds for Nz=129), making all CST voxel-to-world conversions wrong.
+
+**Fix** (`matRad/geometry/geometry.py`, three functions):
+```python
+Ny, Nx, Nz = int(dims[0]), int(dims[1]), int(dims[2])  # ensure native int (avoids uint8 overflow)
+```
+
+### 9. `mat_struct` Not Iterable in `fluence_optimization.py` (TG119)
+**Problem**: TG119's CST column 5 is a single `mat_struct` (scipy.io squeezes single-element cell arrays). The optimizer's `_initialize_weights` and `_collect_objectives` used `for obj in row[5]`, which fails with `TypeError: 'mat_struct' object is not iterable`.
+
+**Fix** (`matRad/optimization/fluence_optimization.py`):
+- Added `_obj_is_empty()` helper (catches TypeError for mat_struct)
+- Added `_wrap_objectives()` to normalize single mat_struct → list
+- Added `_matstruct_to_objective()` to convert mat_struct (className/parameters/penalty) to `DoseObjective`
+
+### 10. `mat_struct` Len Error in `get_iso_center` (TG119)
+**Problem**: `len(row[5])` raises `TypeError` when `row[5]` is a `mat_struct`.
+
+**Fix** (`matRad/geometry/geometry.py`): Added `_obj_is_empty()` helper with TypeError catch.
+
+### 11. Ambiguous Truth Value in `plot_slice` (TG119)
+**Problem**: `if cube_hu and ...` where `cube_hu` is a raw 3D numpy array (TG119 stores `cubeHU` as bare array, not list).
+
+**Fix** (`gui/matrad_gui.py`): Check type explicitly (`isinstance(cube_hu, list)` vs `ndarray`).
+
 ---
 
 ## What Remains To Do
 
 ### Priority 1: Verification (Run and Compare with MATLAB)
-- [ ] Run `example1_phantom.py` on a system with enough memory (>4GB RAM recommended)
-- [ ] Run `example2_photons.py` (requires TG119.mat available or falls back to synthetic phantom)
-- [ ] Compare dose distributions, DVH, and quality indicators with MATLAB output
+- [x] Dose calc verified against MATLAB `photons_testData.mat`: max dose error **0.72%**, target D_mean **2.2%**
+- [x] `example1_phantom.py` verified: optimizer converged (170 iter), target D_5=45.6 Gy, D_mean=39 Gy, plan analysis QI correct
+- [x] Run `example2_photons.py` (TG119.mat available at `tps/matRad/matRad/phantoms/TG119.mat`) — **DONE 2026-03-20**
+- [x] TG119 results: OuterTarget D_mean=49.8 Gy (fine, 40°) vs 49.4 Gy (coarse, 50°); Core OAR 16.7 vs 21.9 Gy — physically reasonable
+- [ ] Compare dose distributions, DVH, and quality indicators with MATLAB output (run MATLAB to get reference QI)
 
 ### Priority 2: Known Potential Issues
 - [ ] **SSD computation** (`_compute_ssd` in photon_svd_engine.py): Currently calls siddon_ray_tracer twice per ray. The second call is redundant — refactor to use the first call's `alphas` directly.

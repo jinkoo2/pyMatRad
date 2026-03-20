@@ -273,7 +273,7 @@ def run_example2():
 
         # DVH comparison
         ax_dvh = axes[2]
-        colors = plt.cm.get_cmap("tab10")(np.linspace(0, 1, len(result["dvh"])))
+        colors = plt.colormaps["tab10"](np.linspace(0, 1, len(result["dvh"])))
         for i, dvh in enumerate(result["dvh"]):
             if not dvh.get("doseValues", []) is None and len(dvh.get("doseValues", [])) > 0:
                 ax_dvh.plot(
@@ -299,7 +299,7 @@ def run_example2():
         ax_dvh.grid(True, alpha=0.3)
         ax_dvh.set_ylim(0, 105)
 
-        out_file = "/tmp/pyMatRad_example2.png"
+        out_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pyMatRad_example2.png")
         plt.tight_layout()
         plt.savefig(out_file, dpi=100, bbox_inches="tight")
         print(f"\nFigure saved to {out_file}")

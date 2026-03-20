@@ -185,7 +185,7 @@ class MatRadGUI:
 
         # Draw contours
         if self.cst is not None:
-            colors = plt.cm.get_cmap("tab20")(np.linspace(0, 1, len(self.cst)))
+            colors = plt.colormaps["tab20"](np.linspace(0, 1, len(self.cst)))
             for roi_idx, row in enumerate(self.cst):
                 vox_list = row[3]
                 if isinstance(vox_list, list) and len(vox_list) > 0:
@@ -231,7 +231,7 @@ class MatRadGUI:
             return
 
         dvh_list = self.result["dvh"]
-        colors = plt.cm.get_cmap("tab20")(np.linspace(0, 1, len(dvh_list)))
+        colors = plt.colormaps["tab20"](np.linspace(0, 1, len(dvh_list)))
 
         for i, dvh in enumerate(dvh_list):
             if dvh.get("doseValues") is None or len(dvh.get("doseValues", [])) == 0:
@@ -335,10 +335,15 @@ def plot_slice(
         fig = ax.get_figure()
 
     dims = ct.get("cubeDim", ct.get("dimensions", [100, 100, 50]))
-    Ny, Nx, Nz = dims[0], dims[1], dims[2]
+    Ny, Nx, Nz = int(dims[0]), int(dims[1]), int(dims[2])
 
-    cube_hu = ct.get("cubeHU", [None])
-    ct_cube = cube_hu[0] if cube_hu and cube_hu[0] is not None else np.zeros((Ny, Nx, Nz))
+    cube_hu = ct.get("cubeHU", None)
+    if isinstance(cube_hu, list):
+        ct_cube = cube_hu[0] if (len(cube_hu) > 0 and cube_hu[0] is not None) else np.zeros((Ny, Nx, Nz))
+    elif isinstance(cube_hu, np.ndarray) and cube_hu.ndim == 3:
+        ct_cube = cube_hu
+    else:
+        ct_cube = np.zeros((Ny, Nx, Nz))
 
     # Default slice
     if slice_idx is None:
@@ -363,14 +368,16 @@ def plot_slice(
     # Display CT
     ax.imshow(ct_slice, cmap="gray", vmin=-1000, vmax=500, origin="lower")
 
-    # Overlay dose
-    if dose is not None and dose.shape == (Ny, Nx, Nz):
+    # Overlay dose (allow dose grid with same Ny, Nx but different Nz)
+    if dose is not None and dose.ndim == 3 and dose.shape[0] == Ny and dose.shape[1] == Nx:
+        dNz = dose.shape[2]
+        dk = min(k if plane == 3 else 0, dNz - 1)
         if plane == 1:
-            dose_slice = dose[:, j, :].T
+            dose_slice = dose[:, min(j, dose.shape[1]-1), :].T
         elif plane == 2:
-            dose_slice = dose[i, :, :].T
+            dose_slice = dose[min(i, dose.shape[0]-1), :, :].T
         else:
-            dose_slice = dose[:, :, k]
+            dose_slice = dose[:, :, dk]
 
         if dose_window is None:
             dose_window = [0, np.max(dose)]
@@ -384,7 +391,7 @@ def plot_slice(
 
     # Draw contours
     if cst is not None:
-        colors = plt.cm.get_cmap("tab20")(np.linspace(0, 1, len(cst)))
+        colors = plt.colormaps["tab20"](np.linspace(0, 1, len(cst)))
         for roi_idx, row in enumerate(cst):
             vox_list = row[3]
             if isinstance(vox_list, list) and len(vox_list) > 0:

@@ -45,12 +45,15 @@ def plan_analysis(
     if dose_cube is None:
         cfg.disp_error("Result does not contain physicalDose!")
 
+    # Map CST voxel indices from CT grid to dose grid (they may differ in resolution)
+    dose_grid = result.get("doseGrid", None)
+    if dose_grid is not None:
+        from ..geometry.geometry import resize_cst_to_grid
+        cst = resize_cst_to_grid(cst, ct, dose_grid)
+
     # Compute DVH and quality indicators for each structure
     dvh_list = []
     qi_list = []
-
-    # Check if dose is in dose grid space
-    dose_grid = result.get("doseGrid", None)
 
     for row in cst:
         struct_name = row[1]
