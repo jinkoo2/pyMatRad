@@ -144,6 +144,7 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
         # Convert CT to water equivalent density
         ct = self._calc_water_eq_density(ct, stf)
         self._cube_wed = ct.get("cube", ct.get("cubeHU"))
+        self._apply_outside_density_mask()
 
         # Preallocate dij sparse matrix
         n_voxels = dij["doseGrid"]["numOfVoxels"]
@@ -183,6 +184,28 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
         cx = np.arange(-kernel_conv_limit * res, kernel_conv_limit * res, res)
         self._conv_mx_x, self._conv_mx_z = np.meshgrid(cx, cx)
         self._kernel_conv_size = 2 * kernel_conv_limit
+
+    def _apply_outside_density_mask(self):
+        """
+        Zero out density for voxels outside all CST structures.
+
+        Port of ignoreOutsideDensities logic in matRad_PencilBeamEngineAbstract.m:
+            eraseCtDensMask = ones(prod(ct.cubeDim),1);
+            eraseCtDensMask(this.VctGrid) = 0;
+            this.cubeWED{i}(eraseCtDensMask == 1) = 0;
+        """
+        if not self.ignore_outside_densities:
+            return
+        if self._V_ct_grid is None or self._cube_wed is None:
+            return
+
+        for i, cube in enumerate(self._cube_wed):
+            n_total = cube.size
+            erase_mask = np.ones(n_total, dtype=bool)
+            erase_mask[self._V_ct_grid - 1] = False  # V_ct_grid is 1-based Fortran-order
+            flat = cube.ravel(order='F').copy()
+            flat[erase_mask] = 0.0
+            self._cube_wed[i] = flat.reshape(cube.shape, order='F')
 
     def _calc_water_eq_density(self, ct: dict, stf: list) -> dict:
         """
@@ -393,6 +416,7 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
         ct = get_world_axes(ct)
         ct = self._calc_water_eq_density(ct, stf)
         self._cube_wed = ct.get("cube", [])
+        self._apply_outside_density_mask()
 
         # Compute SSD for all rays
         cfg.disp_info("Computing SSD for all rays...\n")
@@ -433,6 +457,7 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
             beam_stf_for_ray = {
                 "isoCenter": iso_center,
                 "sourcePoint_bev": source_bev,
+                "sourcePoint": beam.get("sourcePoint", source_bev),
                 "ray": beam["ray"],
                 "SAD": beam["SAD"],
             }

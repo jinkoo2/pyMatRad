@@ -101,12 +101,13 @@ class StfGeneratorBase:
 
         # Optionally add margin
         if self.add_margin:
-            # Add a small margin for numerical stability
-            cst_margin = add_margin(cst, ct, margin=max(
-                ct["resolution"]["x"],
-                ct["resolution"]["y"],
-                ct["resolution"]["z"]
-            ))
+            # MATLAB's PhotonIMRT uses pbMargin = bixelWidth (5mm).
+            # For nominal scenario: margin = max(ct_res, bixelWidth).
+            # This gives round(5/3)=2 voxel expansion to match MATLAB.
+            pb_margin = getattr(self, 'bixel_width', 0.0)
+            max_ct_res = max(ct["resolution"]["x"], ct["resolution"]["y"], ct["resolution"]["z"])
+            margin_mm = max(max_ct_res, pb_margin)
+            cst_margin = add_margin(cst, ct, margin=margin_mm)
             target_voxels_margin = []
             for row in cst_margin:
                 if row[2] == "TARGET":

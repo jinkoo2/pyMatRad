@@ -529,6 +529,10 @@ def add_margin(cst: list, ct: dict, margin: float = 5.0) -> list:
     margin_vox_y = int(np.ceil(margin / res["y"]))
     margin_vox_z = int(np.ceil(margin / res["z"]))
 
+    # Work on a copy so the original cst is not mutated (callers may use
+    # the original cst for isoCenter computation after calling this function)
+    cst = [list(row) for row in cst]
+
     for i, row in enumerate(cst):
         if row[2] != "TARGET":
             continue

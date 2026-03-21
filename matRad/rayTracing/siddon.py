@@ -134,10 +134,10 @@ def siddon_ray_tracer(
             return None, None
         dt = t_ - s
         if dt > 0:
-            i_min = num_planes - (plane_end - alpha_min_ * dt - s) / (plane_end - plane_1) * (num_planes - 1) - 1
+            i_min = num_planes - (plane_end - alpha_min_ * dt - s) / (plane_end - plane_1) * (num_planes - 1)
             i_max = 1 + (s + alpha_max_ * dt - plane_1) / (plane_end - plane_1) * (num_planes - 1)
         else:
-            i_min = num_planes - (plane_end - alpha_max_ * dt - s) / (plane_end - plane_1) * (num_planes - 1) - 1
+            i_min = num_planes - (plane_end - alpha_max_ * dt - s) / (plane_end - plane_1) * (num_planes - 1)
             i_max = 1 + (s + alpha_min_ * dt - plane_1) / (plane_end - plane_1) * (num_planes - 1)
         # Rounding trick from MATLAB
         i_min = int(np.ceil(np.round(i_min * 1000) / 1000))
@@ -405,6 +405,8 @@ def ray_tracing_fast(
     isocenter_cube = world_to_cube_coords(np.atleast_2d(isocenter_world), ct)[0]
 
     source_point_bev = np.asarray(stf_beam["sourcePoint_bev"])
+    # Use world-space source/target for Siddon (BEV coords only valid for gantry=0)
+    source_point_world = np.asarray(stf_beam.get("sourcePoint", source_point_bev))
     rays = stf_beam["ray"]
     n_voxels = len(V_ct_grid)
 
@@ -442,28 +444,27 @@ def ray_tracing_fast(
         if len(ray_voxel_indices) == 0:
             continue
 
-        # Target point for this ray (at far side of patient)
+        # Use world-space target (correct for non-zero gantry angles).
+        # BEV target traces along BEV y-axis in cube space, which is only
+        # correct for gantry=0°. World target traces the actual beam path.
+        target_world = np.asarray(ray.get("targetPoint", ray["targetPoint_bev"]))
         target_bev = np.asarray(ray["targetPoint_bev"])
 
         for scen_idx in range(num_ct_scen):
             cube = ct["cube"][scen_idx]
 
             alphas, l_seg, rho_seg, d12, ix = siddon_ray_tracer(
-                isocenter_cube, res, source_point_bev, target_bev, [cube]
+                isocenter_cube, res, source_point_world, target_world, [cube]
             )
 
             if len(alphas) < 2:
                 continue
 
-            # For each voxel in this ray group, its rad depth is the
-            # cumulative sum along the ray up to its depth
-            # The voxel's BEV depth is vox_bev_from_iso[:,1] (from iso center, + = distal)
-            # The ray goes from source (alpha=0) to target (alpha=1)
-            # Alpha for a voxel at depth d_y from iso:
-            # d_y = alpha * (target_y - source_y) + source_y
-            # alpha = (d_y - source_y) / (target_y - source_y)
-            src_y = source_point_bev[1]
-            tgt_y = target_bev[1]
+            # Compute voxel alpha along the ray using BEV y-depth projection.
+            # This is equivalent to the world-space dot-product projection for
+            # small off-axis angles (bixelWidth/SAD << 1), which holds here.
+            src_y = source_point_bev[1]   # BEV y of source = -SAD
+            tgt_y = target_bev[1]         # BEV y of target (SAD for center ray)
             dt_y = tgt_y - src_y
 
             if abs(dt_y) < 1e-6:

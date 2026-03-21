@@ -43,7 +43,7 @@ class DoseEngineBase:
         self.geometric_lateral_cutoff = 50.0   # mm
         self.dosimetric_lateral_cutoff = 0.995
         self.use_given_eq_density_cube = False
-        self.ignore_outside_densities = False
+        self.ignore_outside_densities = True
         self.ssd_density_threshold = 0.05
         self.keep_rad_depth_cubes = False
         self.num_of_dij_fill_steps = 10
@@ -115,11 +115,14 @@ class DoseEngineBase:
 
         # Set up dose grid
         dg_res = self.dose_grid.get("resolution", ct["resolution"])
+        # Use tiny epsilon (not half-step) to match MATLAB's colon semantics: a:step:b
+        # MATLAB stops at the last value <= b; using step/2 would add an extra point.
+        _eps = dg_res["x"] * 1e-6
         dij["doseGrid"] = {
             "resolution": dg_res,
-            "x": np.arange(ct["x"][0], ct["x"][-1] + dg_res["x"] * 0.5, dg_res["x"]),
-            "y": np.arange(ct["y"][0], ct["y"][-1] + dg_res["y"] * 0.5, dg_res["y"]),
-            "z": np.arange(ct["z"][0], ct["z"][-1] + dg_res["z"] * 0.5, dg_res["z"]),
+            "x": np.arange(ct["x"][0], ct["x"][-1] + _eps, dg_res["x"]),
+            "y": np.arange(ct["y"][0], ct["y"][-1] + _eps, dg_res["y"]),
+            "z": np.arange(ct["z"][0], ct["z"][-1] + _eps, dg_res["z"]),
         }
         dij["doseGrid"]["dimensions"] = np.array([
             len(dij["doseGrid"]["y"]),
