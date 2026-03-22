@@ -208,9 +208,29 @@ and the C/C++ implementations (`round()` rounds half away from zero). Max dose i
 to 4 decimal places across all backends.
 
 **Next acceleration target: the per-bixel kernel convolution loop in `photon_svd_engine.py`.**
-Options:
-- Parallelize the bixel loop with `concurrent.futures.ThreadPoolExecutor` (GIL-free FFT)
-- NumPy-vectorize the bixel accumulation using batch FFT (`scipy.fft.fft2` on 3-D stack)
+
+## Threading Results (Example 1, 16 CPUs, ThreadPoolExecutor)
+
+After parallelizing the per-ray bixel loop with `concurrent.futures.ThreadPoolExecutor`:
+
+| Config                      | Time (s) | Speedup vs serial Python |
+|-----------------------------|----------|--------------------------|
+| python (serial, before)     |   153.1  | 1.00×                    |
+| python (16 threads, after)  |   133.9  | **1.14×**                |
+| c     (16 threads)          |   131.9  | 1.16×                    |
+
+**Why the speedup is modest (14% with 16 threads):**
+
+Python's GIL limits thread parallelism. `scipy.RegularGridInterpolator.__call__` is a
+Python-level function — even though its internal numpy operations release the GIL, the
+Python function call overhead and index-computation logic holds it. Only the bulk numpy
+math (exponentials, multiplications) fully releases the GIL.
+
+**Next step to improve further:**
+- **Vectorized batch processing**: pre-collect all rays' `rad_depths`, `lat_x`, `lat_z` as
+  padded 2-D arrays, then call `RegularGridInterpolator` once on the entire batch
+  (eliminates per-ray Python call overhead and gets full numpy BLAS/MKL parallelism)
+- **ProcessPoolExecutor**: escape the GIL entirely (higher overhead due to pickling)
 
 ## Future Work: GPU (CuPy / CUDA)
 
