@@ -53,10 +53,7 @@ def activate(backend: str | None = None) -> str:
         backend = _be_mod.get_backend()
 
     if backend == "python":
-        # reset to original
-        _patch(_siddon_mod.__dict__["_orig_siddon_ray_tracer"]
-               if "_orig_siddon_ray_tracer" in _siddon_mod.__dict__
-               else _siddon_py_original)
+        _patch(_siddon_py_original)
         return "python"
 
     try:

@@ -7,10 +7,12 @@ References:
     [1] Scholz 1994 PMB (PMID: 8497215) - SVD-based photon kernel decomposition
 """
 
+import os
 import numpy as np
 import scipy.sparse as sp
 from scipy.fft import fft2, ifft2
 from scipy.interpolate import RegularGridInterpolator
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Dict, Any
 
 from .dose_engine_base import DoseEngineBase
@@ -477,73 +479,72 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
             iso_lat_x = vox_bev_from_iso[:, 0] * proj_factor  # lateral X at iso
             iso_lat_z = vox_bev_from_iso[:, 2] * proj_factor  # lateral Z at iso
 
-            # Process each ray
-            for ray_idx, ray in enumerate(beam["ray"]):
-                ray_pos_bev = np.asarray(ray["rayPos_bev"])
+            # Pre-extract beam-level constants (avoids repeated attribute lookups in threads)
+            cutoff_sq = self._effective_lateral_cutoff ** 2
+            _SAD     = float(SAD)
+            _m       = float(self.machine["data"].get("m", 0.03))
+            _betas   = np.asarray(self.machine["data"].get("betas", [0.04, 0.15, 0.60])).ravel()
+            _beam_ik = (None if self.use_custom_primary_photon_fluence
+                        else self._interp_kernel_cache)
+            _ignore  = self.ignore_invalid_values
 
-                # Radial distance from this ray
-                rad_dist_sq = (iso_lat_x - ray_pos_bev[0]) ** 2 + (iso_lat_z - ray_pos_bev[2]) ** 2
-                cutoff_sq = self._effective_lateral_cutoff ** 2
-
-                # Valid voxels: within lateral cutoff and with finite rad depth
-                valid = (rad_dist_sq <= cutoff_sq) & np.isfinite(rad_depths)
+            # Worker: compute dose for one ray, return results or None if empty/invalid
+            def _process_ray(args):
+                ray_idx, ray = args
+                rp = np.asarray(ray["rayPos_bev"])
+                rdsq = (iso_lat_x - rp[0]) ** 2 + (iso_lat_z - rp[2]) ** 2
+                valid = (rdsq <= cutoff_sq) & np.isfinite(rad_depths)
 
                 if not np.any(valid):
-                    for _ in ray.get("energy", [1.0]):
-                        bixel_counter += 1
-                    continue
+                    return ray_idx, None
 
                 vox_ix = np.where(valid)[0]
 
-                # Get interp kernels for this ray
-                if self.use_custom_primary_photon_fluence:
-                    interp_kernels = self._get_kernel_interpolators(self._Fpre)
-                else:
-                    interp_kernels = self._interp_kernel_cache
+                ik = (self._get_kernel_interpolators(self._Fpre)
+                      if self.use_custom_primary_photon_fluence else _beam_ik)
+                if ik is None:
+                    return ray_idx, None
 
-                if interp_kernels is None:
-                    for _ in ray.get("energy", [1.0]):
-                        bixel_counter += 1
-                    continue
-
-                # Compute bixel dose
-                bixel_dose = self._calc_single_bixel(
-                    float(SAD),
-                    self.machine["data"].get("m", 0.03),
-                    np.asarray(self.machine["data"].get("betas", [0.04, 0.15, 0.60])).ravel(),
-                    interp_kernels,
+                bd = self._calc_single_bixel(
+                    _SAD, _m, _betas, ik,
                     rad_depths[vox_ix],
-                    geo_dists[vox_ix],  # geometric distance from source
-                    iso_lat_x[vox_ix] - ray_pos_bev[0],
-                    iso_lat_z[vox_ix] - ray_pos_bev[2],
-                    self.ignore_invalid_values,
+                    geo_dists[vox_ix],
+                    iso_lat_x[vox_ix] - rp[0],
+                    iso_lat_z[vox_ix] - rp[2],
+                    _ignore,
                 )
 
-                # Apply DIJ sampling
                 if self.enable_dij_sampling and not self.is_field_based_dose_calc:
-                    sampled_ix, sampled_dose = self._sample_dij(
-                        vox_ix, bixel_dose, rad_depths[vox_ix],
-                        rad_dist_sq[vox_ix], self._field_width
+                    six, sd = self._sample_dij(
+                        vox_ix, bd, rad_depths[vox_ix], rdsq[vox_ix], self._field_width
                     )
                 else:
-                    sampled_ix, sampled_dose = vox_ix, bixel_dose
+                    six, sd = vox_ix, bd
 
-                # Map local dose voxel indices to dose grid linear indices
-                dose_lin_ix = self._V_dose_grid[sampled_ix] - 1  # 0-based
+                dli = self._V_dose_grid[six] - 1  # 0-based dose grid indices
+                return ray_idx, (dli, sd)
 
-                # Store in dij bookkeeping
+            # Process all rays in parallel (scipy/numpy ops release the GIL)
+            n_workers = min(
+                int(os.environ.get("PYMATRAD_WORKERS", os.cpu_count() or 1)),
+                len(beam["ray"]),
+            )
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                ray_results = list(pool.map(_process_ray, enumerate(beam["ray"])))
+
+            # Write results to dose_matrix sequentially (lil_matrix is not thread-safe)
+            for ray_idx, result in ray_results:
                 dij["bixelNum"][bixel_counter] = ray_idx + 1
-                dij["rayNum"][bixel_counter] = ray_idx + 1
-                dij["beamNum"][bixel_counter] = beam_idx + 1
+                dij["rayNum"][bixel_counter]   = ray_idx + 1
+                dij["beamNum"][bixel_counter]  = beam_idx + 1
 
-                # Fill dose matrix
-                valid_dose = sampled_dose > 0
-                if np.any(valid_dose):
-                    dose_matrix[dose_lin_ix[valid_dose], bixel_counter] = sampled_dose[valid_dose]
+                if result is not None:
+                    dose_lin_ix, sampled_dose = result
+                    valid_dose = sampled_dose > 0
+                    if np.any(valid_dose):
+                        dose_matrix[dose_lin_ix[valid_dose], bixel_counter] = sampled_dose[valid_dose]
 
                 bixel_counter += 1
-
-                # Progress
                 if bixel_counter % 100 == 0:
                     cfg.disp_info(f"\r  Progress: {bixel_counter}/{dij['totalNumOfBixels']} bixels")
 
