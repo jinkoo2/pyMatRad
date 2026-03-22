@@ -12,7 +12,7 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.fft import fft2, ifft2
 from scipy.interpolate import RegularGridInterpolator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from typing import List, Optional, Dict, Any
 
 from .dose_engine_base import DoseEngineBase
@@ -20,6 +20,202 @@ from ...config import MatRad_Config
 from ...geometry import get_world_axes
 from ...geometry.geometry import get_rotation_matrix, world_to_cube_coords
 from ...rayTracing.dispatch import siddon_ray_tracer
+
+
+# ---------------------------------------------------------------------------
+# Module-level worker functions (must be at module scope to be picklable on
+# Windows, where multiprocessing uses the 'spawn' start method).
+# ---------------------------------------------------------------------------
+
+def _sample_dij_worker(ix, bixel_dose, rad_depths, rad_dist_sq,
+                        bixel_width, dij_sampling):
+    """Standalone _sample_dij for worker processes."""
+    import numpy as np
+    rel_dose_threshold = dij_sampling.get("relDoseThreshold", 0.01)
+    lat_cutoff         = dij_sampling.get("latCutOff", 20.0) + bixel_width / np.sqrt(2)
+    sample_type        = dij_sampling.get("type", "radius")
+    delta_rad_depth    = dij_sampling.get("deltaRadDepth", 5.0)
+
+    if sample_type == "radius":
+        ix_core = rad_dist_sq < lat_cutoff ** 2
+    elif sample_type == "dose":
+        ix_core = bixel_dose > rel_dose_threshold * np.max(bixel_dose)
+    else:
+        ix_core = np.ones(len(ix), dtype=bool)
+
+    dose_core    = bixel_dose[ix_core]
+    ix_core_vals = ix[ix_core]
+
+    if np.all(ix_core):
+        return ix, bixel_dose
+
+    ix_tail       = ~ix_core
+    tail_ix       = ix[ix_tail]
+    tail_dose     = bixel_dose[ix_tail]
+    tail_rad_depth = rad_depths[ix_tail]
+
+    if len(tail_ix) == 0:
+        return ix_core_vals, dose_core
+
+    B_r           = np.ceil(tail_rad_depth).astype(int)
+    max_rad_depth = int(np.max(B_r))
+    if max_rad_depth == 0:
+        return ix_core_vals, dose_core
+
+    n_clusters = max(1, int(np.round(max_rad_depth / delta_rad_depth)))
+    C          = np.linspace(0, max_rad_depth, n_clusters + 1).astype(int)
+
+    new_ix, new_dose = [], []
+    for c_idx in range(len(C) - 1):
+        mask = (B_r >= C[c_idx]) & (B_r < C[c_idx + 1])
+        if not np.any(mask):
+            continue
+        sub_dose = tail_dose[mask]
+        sub_ix   = tail_ix[mask]
+        threshold_dose = np.max(sub_dose)
+        if threshold_dose <= 0:
+            continue
+        r = np.random.rand(len(sub_dose))
+        sampled = r <= (sub_dose / threshold_dose)
+        new_ix.extend(sub_ix[sampled].tolist())
+        new_dose.extend(np.full(np.sum(sampled), threshold_dose).tolist())
+
+    if new_ix:
+        return (np.concatenate([ix_core_vals, np.array(new_ix)]),
+                np.concatenate([dose_core,    np.array(new_dose)]))
+    return ix_core_vals, dose_core
+
+
+def _calc_beam_worker(bundle):
+    """
+    Per-beam dose worker.
+
+    Receives pre-computed geometry arrays from the main process (geometry
+    rotation + ray tracing are done sequentially in the main process to avoid
+    pickling large CT/vox-coord arrays).  The worker does only the per-ray
+    batch dose math and returns COO sparse data.
+    """
+    import numpy as np
+
+    beam_idx       = bundle['beam_idx']
+    bixel_start    = bundle['bixel_start']
+    rays           = bundle['rays']
+    ik             = bundle['ik']          # list of RegularGridInterpolator
+    rad_depths     = bundle['rad_depths']
+    geo_dists      = bundle['geo_dists']
+    iso_lat_x      = bundle['iso_lat_x']
+    iso_lat_z      = bundle['iso_lat_z']
+    V_dose_grid    = bundle['V_dose_grid']
+    cutoff_sq      = bundle['cutoff_sq']
+    SAD            = bundle['SAD']
+    m              = bundle['m']
+    betas          = np.asarray(bundle['betas']).ravel()
+    ignore_invalid        = bundle['ignore_invalid']
+    enable_dij_sampling   = bundle['enable_dij_sampling']
+    is_field_based        = bundle['is_field_based']
+    field_width           = bundle['field_width']
+    dij_sampling          = bundle['dij_sampling']
+
+    n_kernels = len(betas)
+
+    # Phase 1: per-ray validity masks (cheap index arithmetic)
+    ray_data = []
+    for ray_idx, ray in enumerate(rays):
+        rp   = np.asarray(ray['rayPos_bev'])
+        rdsq = (iso_lat_x - rp[0]) ** 2 + (iso_lat_z - rp[2]) ** 2
+        valid = (rdsq <= cutoff_sq) & np.isfinite(rad_depths)
+        if np.any(valid):
+            vox_ix = np.where(valid)[0]
+            ray_data.append({
+                'ray_idx': ray_idx, 'vox_ix': vox_ix,
+                'rdsq':  rdsq[vox_ix],
+                'lat_x': iso_lat_x[vox_ix] - rp[0],
+                'lat_z': iso_lat_z[vox_ix] - rp[2],
+                'dose':  None,
+            })
+        else:
+            ray_data.append({'ray_idx': ray_idx, 'vox_ix': None})
+
+    # Phase 2: vectorized batch dose computation (one call covers all rays)
+    active = [r for r in ray_data if r['vox_ix'] is not None]
+    if active and ik is not None:
+        all_rd = np.concatenate([rad_depths[r['vox_ix']] for r in active])
+        all_gd = np.concatenate([geo_dists[r['vox_ix']]  for r in active])
+        all_lx = np.concatenate([r['lat_x']               for r in active])
+        all_lz = np.concatenate([r['lat_z']               for r in active])
+
+        # Depth-dose components (Scholz 1994, Eq. 17)
+        dose_component = np.zeros((len(all_rd), n_kernels))
+        for ki in range(n_kernels):
+            beta = betas[ki]
+            if abs(beta - m) < 1e-10:
+                dose_component[:, ki] = m * all_rd * np.exp(-m * all_rd)
+            else:
+                dose_component[:, ki] = (
+                    beta / (beta - m) *
+                    (np.exp(-m * all_rd) - np.exp(-beta * all_rd))
+                )
+
+        # Lateral kernel values (Eq. 19)
+        pts = np.column_stack([all_lz, all_lx])
+        for ki in range(n_kernels):
+            if ki < len(ik):
+                kv = ik[ki](pts)
+                kv = np.where(np.isnan(kv), 0.0, kv)
+                dose_component[:, ki] *= kv
+
+        all_dose  = np.sum(dose_component, axis=1)
+        all_dose *= (SAD / all_gd) ** 2
+        all_dose  = np.maximum(all_dose, 0.0)
+
+        sizes  = [len(r['vox_ix']) for r in active]
+        chunks = np.split(all_dose, np.cumsum(sizes[:-1]))
+        for r, chunk in zip(active, chunks):
+            r['dose'] = chunk
+
+    # Phase 3: build COO return data
+    bixelNums, rayNums = [], []
+    coo_rows_parts, coo_cols_parts, coo_data_parts = [], [], []
+
+    for local_col, rd in enumerate(ray_data):
+        ray_idx = rd['ray_idx']
+        bixelNums.append(ray_idx + 1)
+        rayNums.append(ray_idx + 1)
+
+        if rd['vox_ix'] is not None and rd.get('dose') is not None:
+            vox_ix = rd['vox_ix']
+            bd     = rd['dose']
+            if enable_dij_sampling and not is_field_based:
+                six, sd = _sample_dij_worker(
+                    vox_ix, bd, rad_depths[vox_ix], rd['rdsq'],
+                    field_width, dij_sampling,
+                )
+            else:
+                six, sd = vox_ix, bd
+
+            dli        = V_dose_grid[six] - 1
+            valid_dose = sd > 0
+            if np.any(valid_dose):
+                coo_rows_parts.append(dli[valid_dose].astype(np.int32))
+                coo_cols_parts.append(
+                    np.full(valid_dose.sum(), bixel_start + local_col, dtype=np.int32)
+                )
+                coo_data_parts.append(sd[valid_dose])
+
+    print(f"  Beam {beam_idx + 1}: {len(ray_data)} bixels done.", flush=True)
+    return {
+        'beam_idx':    beam_idx,
+        'bixel_start': bixel_start,
+        'n_bixels':    len(ray_data),
+        'bixelNums':   bixelNums,
+        'rayNums':     rayNums,
+        'coo_rows': np.concatenate(coo_rows_parts) if coo_rows_parts
+                    else np.empty(0, dtype=np.int32),
+        'coo_cols': np.concatenate(coo_cols_parts) if coo_cols_parts
+                    else np.empty(0, dtype=np.int32),
+        'coo_data': np.concatenate(coo_data_parts) if coo_data_parts
+                    else np.empty(0, dtype=np.float64),
+    }
 
 
 class PhotonPencilBeamSVDEngine(DoseEngineBase):
@@ -409,9 +605,12 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
 
     def _calc_dose(self, ct: dict, cst: list, stf: list, dij: dict) -> dict:
         """
-        Main dose calculation loop.
+        Main dose calculation loop — beam-level parallel via ProcessPoolExecutor.
 
-        Port of calcDose method in matRad_PencilBeamEngineAbstract.m
+        The main process runs setup (SSD, FFT kernel convolution, geometry
+        rotation, ray tracing) sequentially for all beams, then fans out the
+        per-ray batch dose math to one worker process per beam.  Workers return
+        COO sparse data; the main process assembles the final DIJ matrix.
         """
         cfg = MatRad_Config.instance()
 
@@ -420,139 +619,130 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
         self._cube_wed = ct.get("cube", [])
         self._apply_outside_density_mask()
 
-        # Compute SSD for all rays
         cfg.disp_info("Computing SSD for all rays...\n")
         self._compute_ssd(ct, stf)
 
         n_voxels_dose = dij["doseGrid"]["numOfVoxels"]
-        n_bixels = dij["totalNumOfBixels"]
-        dose_matrix = sp.lil_matrix((n_voxels_dose, n_bixels))
+        n_bixels      = dij["totalNumOfBixels"]
 
-        bixel_counter = 0
+        # Pre-compute per-beam bixel start indices
+        bixel_starts, offset = [], 0
+        for b in stf:
+            bixel_starts.append(offset)
+            offset += b["totalNumOfBixels"]
 
-        for beam_idx, beam in enumerate(stf):
-            cfg.disp_info(f"\nBeam {beam_idx+1}/{len(stf)}: gantry={beam['gantryAngle']}°\n")
+        from ...rayTracing.dispatch import ray_tracing_fast
 
-            # Initialize beam
+        # ------------------------------------------------------------------ #
+        # Sequential setup: FFT convolution + geometry + ray tracing per beam #
+        # (cheap vs the batch dose math; avoids pickling large CT / vox arrays)#
+        # ------------------------------------------------------------------ #
+        bundles = []
+        for beam_idx, beam_stf in enumerate(stf):
+            cfg.disp_info(f"\nBeam {beam_idx+1}/{len(stf)}: gantry={beam_stf['gantryAngle']}°\n")
             beam = self._init_beam(ct, cst, stf, beam_idx, dij)
 
-            # Get rotation matrix
-            rot_mat = get_rotation_matrix(beam["gantryAngle"], beam["couchAngle"])
-
-            # Compute BEV coordinates for dose grid voxels
+            rot_mat    = get_rotation_matrix(beam["gantryAngle"], beam["couchAngle"])
             iso_center = np.asarray(beam["isoCenter"])
-            coords_dose_grid = self._vox_world_coords_dose_grid - iso_center
-            rot_coords = coords_dose_grid @ rot_mat  # (N, 3) in BEV
-
-            # Subtract source point
             source_bev = np.asarray(beam["sourcePoint_bev"])
-            rot_coords_relative = rot_coords - source_bev  # relative to source
 
-            # Geometric distances from source
-            geo_dists = np.sqrt(np.sum(rot_coords_relative ** 2, axis=1))
+            rot_coords          = (self._vox_world_coords_dose_grid - iso_center) @ rot_mat
+            rot_coords_relative = rot_coords - source_bev
+            geo_dists           = np.sqrt(np.sum(rot_coords_relative ** 2, axis=1))
 
-            # Compute radiological depths using ray tracing
             cfg.disp_info("  Ray tracing for radiological depths...\n")
-            iso_cube = world_to_cube_coords(np.atleast_2d(iso_center), ct)[0]
+            rad_depths = ray_tracing_fast(
+                {
+                    "isoCenter":       iso_center,
+                    "sourcePoint_bev": source_bev,
+                    "sourcePoint":     beam.get("sourcePoint", source_bev),
+                    "ray":             beam["ray"],
+                    "SAD":             beam["SAD"],
+                },
+                ct, self._V_dose_grid, rot_coords_relative,
+                self._effective_lateral_cutoff,
+            )[0]
 
-            from ...rayTracing.dispatch import ray_tracing_fast
-            beam_stf_for_ray = {
-                "isoCenter": iso_center,
-                "sourcePoint_bev": source_bev,
-                "sourcePoint": beam.get("sourcePoint", source_bev),
-                "ray": beam["ray"],
-                "SAD": beam["SAD"],
-            }
-            rad_depths_list = ray_tracing_fast(
-                beam_stf_for_ray, ct, self._V_dose_grid,
-                rot_coords_relative, self._effective_lateral_cutoff
+            SAD          = beam["SAD"]
+            proj_factor  = SAD / np.where(
+                np.abs(SAD + rot_coords[:, 1]) < 1e-6,
+                1e-6, SAD + rot_coords[:, 1],
             )
+            iso_lat_x = rot_coords[:, 0] * proj_factor
+            iso_lat_z = rot_coords[:, 2] * proj_factor
 
-            # Use first scenario
-            rad_depths = rad_depths_list[0]
+            ik = (self._get_kernel_interpolators(self._Fpre)
+                  if self.use_custom_primary_photon_fluence
+                  else self._interp_kernel_cache)
 
-            # Project voxel coords onto isocenter plane for lateral distance
-            SAD = beam["SAD"]
-            vox_bev_from_iso = rot_coords  # [y,x,z] in BEV, relative to iso
-            proj_factor = SAD / np.where(np.abs(SAD + vox_bev_from_iso[:, 1]) < 1e-6,
-                                          1e-6, SAD + vox_bev_from_iso[:, 1])
-            iso_lat_x = vox_bev_from_iso[:, 0] * proj_factor  # lateral X at iso
-            iso_lat_z = vox_bev_from_iso[:, 2] * proj_factor  # lateral Z at iso
+            bundles.append({
+                "beam_idx":    beam_idx,
+                "bixel_start": bixel_starts[beam_idx],
+                "rays":        beam["ray"],
+                "ik":          ik,
+                "rad_depths":  rad_depths,
+                "geo_dists":   geo_dists,
+                "iso_lat_x":   iso_lat_x,
+                "iso_lat_z":   iso_lat_z,
+                "V_dose_grid": self._V_dose_grid,
+                "cutoff_sq":   self._effective_lateral_cutoff ** 2,
+                "SAD":         float(SAD),
+                "m":           float(self.machine["data"].get("m", 0.03)),
+                "betas":       np.asarray(
+                    self.machine["data"].get("betas", [0.04, 0.15, 0.60])
+                ).ravel(),
+                "ignore_invalid":       self.ignore_invalid_values,
+                "enable_dij_sampling":  self.enable_dij_sampling,
+                "is_field_based":       self.is_field_based_dose_calc,
+                "field_width":          self._field_width,
+                "dij_sampling":         getattr(self, "dij_sampling", {}),
+            })
 
-            # Pre-extract beam-level constants (avoids repeated attribute lookups in threads)
-            cutoff_sq = self._effective_lateral_cutoff ** 2
-            _SAD     = float(SAD)
-            _m       = float(self.machine["data"].get("m", 0.03))
-            _betas   = np.asarray(self.machine["data"].get("betas", [0.04, 0.15, 0.60])).ravel()
-            _beam_ik = (None if self.use_custom_primary_photon_fluence
-                        else self._interp_kernel_cache)
-            _ignore  = self.ignore_invalid_values
+        # ------------------------------------------------------------------ #
+        # Parallel dose computation — one worker process per beam             #
+        # ------------------------------------------------------------------ #
+        n_workers = min(
+            int(os.environ.get("PYMATRAD_WORKERS", os.cpu_count() or 1)),
+            len(stf),
+        )
+        cfg.disp_info(
+            f"\nComputing dose for {len(stf)} beams "
+            f"with {n_workers} parallel workers...\n"
+        )
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            beam_results = list(pool.map(_calc_beam_worker, bundles))
 
-            # Worker: compute dose for one ray, return results or None if empty/invalid
-            def _process_ray(args):
-                ray_idx, ray = args
-                rp = np.asarray(ray["rayPos_bev"])
-                rdsq = (iso_lat_x - rp[0]) ** 2 + (iso_lat_z - rp[2]) ** 2
-                valid = (rdsq <= cutoff_sq) & np.isfinite(rad_depths)
+        # ------------------------------------------------------------------ #
+        # Assemble COO data into a single CSC dose matrix                     #
+        # ------------------------------------------------------------------ #
+        all_rows = np.concatenate([r["coo_rows"] for r in beam_results])
+        all_cols = np.concatenate([r["coo_cols"] for r in beam_results])
+        all_data = np.concatenate([r["coo_data"] for r in beam_results])
 
-                if not np.any(valid):
-                    return ray_idx, None
+        if len(all_data) > 0:
+            dose_csc = sp.coo_matrix(
+                (all_data, (all_rows, all_cols)),
+                shape=(n_voxels_dose, n_bixels),
+            ).tocsc()
+        else:
+            dose_csc = sp.csc_matrix((n_voxels_dose, n_bixels))
 
-                vox_ix = np.where(valid)[0]
+        # Fill bixel/ray/beam metadata arrays
+        for res in sorted(beam_results, key=lambda r: r["beam_idx"]):
+            beam_idx    = res["beam_idx"]
+            bixel_start = res["bixel_start"]
+            for local_col, (bn, rn) in enumerate(
+                zip(res["bixelNums"], res["rayNums"])
+            ):
+                col = bixel_start + local_col
+                dij["bixelNum"][col] = bn
+                dij["rayNum"][col]   = rn
+                dij["beamNum"][col]  = beam_idx + 1
 
-                ik = (self._get_kernel_interpolators(self._Fpre)
-                      if self.use_custom_primary_photon_fluence else _beam_ik)
-                if ik is None:
-                    return ray_idx, None
+        n_done = sum(r["n_bixels"] for r in beam_results)
+        cfg.disp_info(f"\nDone. Computed {n_done} bixels.\n")
 
-                bd = self._calc_single_bixel(
-                    _SAD, _m, _betas, ik,
-                    rad_depths[vox_ix],
-                    geo_dists[vox_ix],
-                    iso_lat_x[vox_ix] - rp[0],
-                    iso_lat_z[vox_ix] - rp[2],
-                    _ignore,
-                )
-
-                if self.enable_dij_sampling and not self.is_field_based_dose_calc:
-                    six, sd = self._sample_dij(
-                        vox_ix, bd, rad_depths[vox_ix], rdsq[vox_ix], self._field_width
-                    )
-                else:
-                    six, sd = vox_ix, bd
-
-                dli = self._V_dose_grid[six] - 1  # 0-based dose grid indices
-                return ray_idx, (dli, sd)
-
-            # Process all rays in parallel (scipy/numpy ops release the GIL)
-            n_workers = min(
-                int(os.environ.get("PYMATRAD_WORKERS", os.cpu_count() or 1)),
-                len(beam["ray"]),
-            )
-            with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                ray_results = list(pool.map(_process_ray, enumerate(beam["ray"])))
-
-            # Write results to dose_matrix sequentially (lil_matrix is not thread-safe)
-            for ray_idx, result in ray_results:
-                dij["bixelNum"][bixel_counter] = ray_idx + 1
-                dij["rayNum"][bixel_counter]   = ray_idx + 1
-                dij["beamNum"][bixel_counter]  = beam_idx + 1
-
-                if result is not None:
-                    dose_lin_ix, sampled_dose = result
-                    valid_dose = sampled_dose > 0
-                    if np.any(valid_dose):
-                        dose_matrix[dose_lin_ix[valid_dose], bixel_counter] = sampled_dose[valid_dose]
-
-                bixel_counter += 1
-                if bixel_counter % 100 == 0:
-                    cfg.disp_info(f"\r  Progress: {bixel_counter}/{dij['totalNumOfBixels']} bixels")
-
-        cfg.disp_info(f"\nDone. Computed {bixel_counter} bixels.\n")
-
-        # Convert to CSC sparse matrix for efficiency
-        dij["physicalDose"] = [dose_matrix.tocsc()]
-
+        dij["physicalDose"] = [dose_csc]
         return dij
 
     @staticmethod

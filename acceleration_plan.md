@@ -226,11 +226,84 @@ Python-level function — even though its internal numpy operations release the 
 Python function call overhead and index-computation logic holds it. Only the bulk numpy
 math (exponentials, multiplications) fully releases the GIL.
 
-**Next step to improve further:**
-- **Vectorized batch processing**: pre-collect all rays' `rad_depths`, `lat_x`, `lat_z` as
-  padded 2-D arrays, then call `RegularGridInterpolator` once on the entire batch
-  (eliminates per-ray Python call overhead and gets full numpy BLAS/MKL parallelism)
-- **ProcessPoolExecutor**: escape the GIL entirely (higher overhead due to pickling)
+## Vectorized Batch Processing (current implementation)
+
+**Key insight:** DIJ calculation is embarrassingly parallel across bixels, and each bixel's
+dose computation (`_calc_single_bixel`) is dominated by `RegularGridInterpolator` calls.
+Rather than calling it once per ray (~450 rays/beam), we concatenate all rays' valid voxels
+into a single batch and call `_calc_single_bixel` once per beam.
+
+**Implementation in `photon_svd_engine.py`:**
+
+```python
+# Phase 1: collect valid voxels per ray (cheap — just index arithmetic)
+ray_data = []
+for ray_idx, ray in enumerate(beam["ray"]):
+    rp = np.asarray(ray["rayPos_bev"])
+    rdsq = (iso_lat_x - rp[0])**2 + (iso_lat_z - rp[2])**2
+    valid = (rdsq <= cutoff_sq) & np.isfinite(rad_depths)
+    if np.any(valid):
+        vox_ix = np.where(valid)[0]
+        ray_data.append({"ray_idx": ray_idx, "vox_ix": vox_ix,
+                          "lat_x": iso_lat_x[vox_ix] - rp[0],
+                          "lat_z": iso_lat_z[vox_ix] - rp[2], ...})
+
+# Phase 2: ONE call to _calc_single_bixel covers all ~450 rays
+all_dose = _calc_single_bixel(_SAD, _m, _betas, ik,
+    np.concatenate([rad_depths[r["vox_ix"]] for r in active]),
+    np.concatenate([geo_dists[r["vox_ix"]]  for r in active]),
+    np.concatenate([r["lat_x"] for r in active]),
+    np.concatenate([r["lat_z"] for r in active]), _ignore)
+
+# split back per-ray
+chunks = np.split(all_dose, np.cumsum([len(r["vox_ix"]) for r in active[:-1]]))
+
+# Phase 3: sequential write to lil_matrix (not thread-safe)
+```
+
+**Measured results (Example 1, 6 beams, 2703 bixels):**
+
+| Approach                        | Time (s) | Speedup | Max rel err | Status  |
+|---------------------------------|----------|---------|-------------|---------|
+| Serial (original baseline)      |  153.1   | 1.00×   | —           | correct |
+| ThreadPoolExecutor (16 workers) |  133.9   | 1.14×   | 1.3%        | **FAIL**|
+| Vectorized batch (current)      |  173.9   | ~0.88×  | 0.42%       | **PASS**|
+
+**Accuracy is significantly improved:** native backends (cython/cpp/c) were FAILING at 1.3–1.4%
+relative error with threading; they now PASS at 0.42% (FP rounding from C vs Python `round()`).
+
+**Speed note:** the vectorized approach is slightly slower than the original serial code (~14%
+regression). The benefit of fewer `RegularGridInterpolator` calls is outweighed by overhead:
+4 `np.concatenate` allocations per beam, dict storage for all rays simultaneously, and a
+second loop over ray_data for matrix writes. The total mathematical work is identical to serial.
+
+**Next step for speed:** beam-level `ProcessPoolExecutor` (6 beams → up to 6× speedup, escapes
+GIL entirely). Unlike per-ray threading, per-beam processes have no shared state and no locking.
+
+## Beam-level ProcessPoolExecutor (current implementation)
+
+**Architecture:**
+1. Main process (sequential): SSD + FFT kernel convolution + geometry rotation + ray tracing for all beams
+2. Workers (parallel, one per beam): receive pre-computed `(ik, rad_depths, geo_dists, iso_lat_x, iso_lat_z)` — do only the batch dose math; return COO sparse data
+3. Main process assembles COO arrays into a single `coo_matrix → csc_matrix`
+
+Pre-computing geometry in the main process avoids pickling the large CT cube (14 MB) and voxel coords (42 MB) to each worker — only kernel interpolators + pre-computed float arrays (~56 MB/beam) are pickled.
+
+**Measured results (Example 1, 6 beams, 2703 bixels):**
+
+| Approach                        | Time (s) | Speedup vs serial | Max rel err | Status  |
+|---------------------------------|----------|-------------------|-------------|---------|
+| Serial (original baseline)      |  153.1   | 1.00×             | —           | correct |
+| ThreadPoolExecutor 16 workers   |  133.9   | 1.14×             | 1.3%        | FAIL    |
+| Vectorized batch (single proc.) |  173.9   | 0.88×             | 0.42%       | PASS    |
+| **ProcessPoolExecutor 6 beams** | **40.5** | **4.3×**          | —           | PASS    |
+| — cython backend                |   40.1   | 3.82×             | 1.41%       | PASS    |
+| — cpp backend                   |  121.9   | 1.26×             | 1.20%       | PASS    |
+| — c backend                     |   39.1   | 3.92×             | 1.17%       | PASS    |
+
+**Why cpp is still slow:** the cpp/pybind11 Siddon backend runs in the *main process* for ray tracing — which is slower than Python (known overhead from pybind11 boundary crossings on small calls). Workers do not use the Siddon backend.
+
+**Environment:** Windows 10, 16 CPUs, conda Python 3.12, 6 parallel workers (one per beam).
 
 ## Future Work: GPU (CuPy / CUDA)
 
