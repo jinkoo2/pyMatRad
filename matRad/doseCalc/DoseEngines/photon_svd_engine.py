@@ -17,7 +17,7 @@ from .dose_engine_base import DoseEngineBase
 from ...config import MatRad_Config
 from ...geometry import get_world_axes
 from ...geometry.geometry import get_rotation_matrix, world_to_cube_coords
-from ...rayTracing.siddon import siddon_ray_tracer
+from ...rayTracing.dispatch import siddon_ray_tracer
 
 
 class PhotonPencilBeamSVDEngine(DoseEngineBase):
@@ -453,7 +453,7 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
             cfg.disp_info("  Ray tracing for radiological depths...\n")
             iso_cube = world_to_cube_coords(np.atleast_2d(iso_center), ct)[0]
 
-            from ...rayTracing.siddon import ray_tracing_fast
+            from ...rayTracing.dispatch import ray_tracing_fast
             beam_stf_for_ray = {
                 "isoCenter": iso_center,
                 "sourcePoint_bev": source_bev,
