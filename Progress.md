@@ -1,34 +1,47 @@
 # pyMatRad Development Progress
 
-## Status: Example 1 ✅ verified. Example 2 ✅ runs end-to-end (TG119, 2026-03-20).
+## Status (2026-03-23): All three engines working. 4.3× SVPB speedup. ompMC calibrated to <1% of SVPB.
 
 ---
 
 ## What Has Been Completed
 
-### All Core Python Files Created
+### All Python Files Created
 
 | File | Status | Notes |
 |------|--------|-------|
-| `matRad/config.py` | ✅ Done | Singleton MatRad_Config |
-| `matRad/scenarios.py` | ✅ Done | NominalScenario |
-| `matRad/geometry/geometry.py` | ✅ Done (bug fixed) | All geometry utilities |
-| `matRad/phantoms/builder/phantom_voi.py` | ✅ Done | Box/Sphere VOI classes |
-| `matRad/phantoms/builder/phantom_builder.py` | ✅ Done | PhantomBuilder class |
-| `matRad/basedata/load_machine.py` | ✅ Done | Loads .mat machine files |
-| `matRad/rayTracing/siddon.py` | ✅ Done (optimized) | Siddon ray tracer + fast version |
-| `matRad/steering/stf_generator.py` | ✅ Done | STF generator for photon IMRT |
-| `matRad/doseCalc/DoseEngines/dose_engine_base.py` | ✅ Done | Base dose engine |
-| `matRad/doseCalc/DoseEngines/photon_svd_engine.py` | ✅ Done (bug fixed) | SVD photon dose engine |
-| `matRad/doseCalc/calc_dose_influence.py` | ✅ Done | Entry point |
-| `matRad/optimization/DoseObjectives/objectives.py` | ✅ Done | All objective functions |
-| `matRad/optimization/fluence_optimization.py` | ✅ Done | L-BFGS-B optimizer |
-| `matRad/planAnalysis/plan_analysis.py` | ✅ Done | DVH + quality indicators |
-| `gui/matrad_gui.py` | ✅ Done | matplotlib GUI |
-| `examples/example1_phantom.py` | ✅ Done | Phantom treatment plan |
-| `examples/example2_photons.py` | ✅ Done | TG119 photon plan |
-| `requirements.txt` | ✅ Done | |
-| `CLAUDE.md` | ✅ Done | |
+| `matRad/config.py` | ✅ | Singleton MatRad_Config |
+| `matRad/scenarios.py` | ✅ | NominalScenario |
+| `matRad/backend.py` | ✅ | CLI/env backend selector (python/cython/cpp/c) |
+| `matRad/geometry/geometry.py` | ✅ bug fixed | All geometry utilities |
+| `matRad/phantoms/builder/phantom_voi.py` | ✅ | Box/Sphere VOI classes |
+| `matRad/phantoms/builder/phantom_builder.py` | ✅ | PhantomBuilder class |
+| `matRad/basedata/load_machine.py` | ✅ | Loads .mat machine files |
+| `matRad/rayTracing/siddon.py` | ✅ optimized | Siddon ray tracer + fast version |
+| `matRad/rayTracing/dispatch.py` | ✅ | Runtime backend switcher |
+| `matRad/rayTracing/_backends/siddon_cython.pyx` | ✅ compiled | Cython backend |
+| `matRad/rayTracing/_backends/siddon_cpp/` | ✅ compiled | pybind11 C++ backend |
+| `matRad/rayTracing/_backends/siddon_c/` | ✅ compiled | Plain C + ctypes backend |
+| `matRad/steering/stf_generator.py` | ✅ bug fixed | STF generator for photon IMRT |
+| `matRad/doseCalc/DoseEngines/dose_engine_base.py` | ✅ | Base dose engine |
+| `matRad/doseCalc/DoseEngines/photon_svd_engine.py` | ✅ bug fixed, parallel | SVD photon dose engine |
+| `matRad/doseCalc/DoseEngines/photon_ompc_engine.py` | ✅ calibrated, parallel | Analytical ompMC engine |
+| `matRad/doseCalc/DoseEngines/topas_mc_engine.py` | ✅ | TOPAS MC engine (photons) |
+| `matRad/doseCalc/calc_dose_influence.py` | ✅ | Entry point |
+| `matRad/optimization/DoseObjectives/objectives.py` | ✅ | All objective functions |
+| `matRad/optimization/fluence_optimization.py` | ✅ | L-BFGS-B optimizer |
+| `matRad/planAnalysis/plan_analysis.py` | ✅ | DVH + quality indicators |
+| `gui/matrad_gui.py` | ✅ | matplotlib GUI |
+| `examples/example1_phantom.py` | ✅ | Full phantom plan (dose + optimization + DVH) |
+| `examples/example2_photons.py` | ✅ | Full TG119 photon plan |
+| `examples/example1_no_opti.py` | ✅ | Standalone SVPB vs ompMC vs TOPAS (water phantom) |
+| `examples/example2_no_opti.py` | ✅ | Same comparison on TG119 |
+| `examples/test_backends.py` | ✅ | Backend accuracy & speed benchmark |
+| `examples/example1_no_opti_compare.py` | ✅ | Compare pyMatRad vs MATLAB ref + OpenTPS GUI |
+| `examples/example2_no_opti_compare.py` | ✅ | Same for TG119 + OpenTPS GUI |
+| `acceleration_plan.md` | ✅ | Documents all acceleration work and profiling results |
+| `requirements.txt` | ✅ | |
+| `CLAUDE.md` | ✅ | |
 
 ---
 
@@ -121,6 +134,77 @@ Ny, Nx, Nz = int(dims[0]), int(dims[1]), int(dims[2])  # ensure native int (avoi
 **Problem**: `if cube_hu and ...` where `cube_hu` is a raw 3D numpy array (TG119 stores `cubeHU` as bare array, not list).
 
 **Fix** (`gui/matrad_gui.py`): Check type explicitly (`isinstance(cube_hu, list)` vs `ndarray`).
+
+### 12. BEV vs World Coordinate Bug in `ray_tracing_fast`
+**Problem**: Voxel coordinates were passed in BEV frame to Siddon, which expects world coordinates. Caused angle-dependent dose errors (wrong for non-zero gantry angles).
+
+**Fix** (`matRad/rayTracing/siddon.py`): Pass world coordinates; rotate inside `ray_tracing_fast` for nearest-ray lookup only.
+
+### 13. `add_margin` In-Place CST Mutation
+**Problem**: `add_margin` modified the shared CST list in-place; different beams got pre-margined data.
+
+**Fix** (`matRad/steering/stf_generator.py`): Copy CST rows before modification.
+
+### 14. STF Margin Size (2304 vs 2568 bixels)
+**Problem**: Python used `margin = max(ct_res) = 3mm`. MATLAB's `getPbMargin()` returns `bixelWidth = 5mm`. `ceil(3/3)=1` voxel vs `round(5/3)=2` voxel expansion → fewer rays.
+
+**Fix** (`matRad/steering/stf_generator.py`): `margin_mm = max(max_ct_res, pb_margin)` — gives 5mm → 2568 bixels ✓
+
+### 15. ompMC Calibration (150M× Wrong Dose)
+**Problem**: `ABS_CALIBRATION_FACTOR = 3.49056e12` copied from MATLAB MC engine (converts MC *histories* to Gy). The Python ompMC uses an analytical formula — this constant is meaningless here. Result: ompMC max dose 706 million Gy/fx vs SVPB 4.7 Gy/fx.
+
+**Fix** (`matRad/doseCalc/DoseEngines/photon_ompc_engine.py`):
+```python
+ABS_CALIBRATION_FACTOR = 23220.0  # empirically calibrated for analytical model
+# effective calib = 23220 * (bixelWidth/50)^2 = 23220 * 0.01 = 232
+```
+Derivation: measured ratio ompMC/SVPB = 1.503×10⁸ → divide effective calib (3.49e10) by ratio.
+
+**Result**: ompMC/SVPB ratio = 0.998 (water), 0.991 (TG119). ompMC 2.7–3.3× faster than SVPB.
+
+### 16. CST Row Iteration in example2_no_opti.py
+**Problem**: `for row_m in cst_m.flat` iterates all 18 individual cells of the `(3,6)` scipy.io object array in C order, not the 3 rows. First `row_m` = `cst_m[0,0]` = int → `row_m[3]` fails.
+
+**Fix** (`examples/example2_no_opti.py`):
+```python
+for i in range(cst_m.shape[0]):
+    row_m = cst_m[i]  # (6,) row, not individual cell
+```
+
+---
+
+## Performance Results
+
+### SVPB Parallelism (photon_svd_engine.py)
+
+| Approach | Time (s) | Speedup |
+|----------|----------|---------|
+| Serial (original) | 153.1 | 1.0× |
+| ThreadPoolExecutor 16 workers | 133.9 | 1.14× (GIL limited) |
+| Vectorized batch | 173.9 | 0.88× (overhead > benefit) |
+| **ProcessPoolExecutor (beam-level)** | **40.5** | **4.3×** |
+
+ProcessPoolExecutor: main process does SSD + FFT + ray tracing; workers do batch dose math per beam; results assembled into COO→CSC matrix.
+
+### Native Siddon Backends
+
+Siddon is NOT the bottleneck. FFT kernel convolution dominates. Speedup from native backends negligible (~3%). All backends agree within 2% (FP rounding from C vs Python `round()`).
+
+| Backend | Time (s) | Speedup | Max abs err |
+|---------|----------|---------|-------------|
+| python  | 153.1    | 1.00×   | — (baseline)|
+| cython  | 148.5    | 1.03×   | 2.37e-02    |
+| cpp     | 228.8    | 0.67×   | 2.37e-02    |
+| c       | 148.5    | 1.03×   | 2.37e-02    |
+
+### ompMC vs SVPB (after calibration fix, 2026-03-23)
+
+| Phantom | SVPB max (Gy/fx) | ompMC max (Gy/fx) | Max ratio | Median voxel ratio | ompMC time |
+|---------|-----------------|------------------|-----------|-------------------|-----------|
+| Water (5 beams)  | 4.709 | 4.699 | 0.998 | 0.987 | 3.3× faster |
+| TG119 (7 beams)  | 5.496 | 5.444 | 0.991 | 0.922 | 2.7× faster |
+
+TG119 per-voxel median 0.922 (vs 0.987 water): simple exponential attenuation does not capture heterogeneity scatter as accurately as SVPB's SVD kernels.
 
 ---
 
