@@ -221,10 +221,35 @@ class DoseEngineBase:
 
     @staticmethod
     def get_engine_from_pln(pln: dict) -> "DoseEngineBase":
-        """Get appropriate dose engine for given plan."""
+        """
+        Return the appropriate dose engine for the given plan.
+
+        Engine is selected via pln['propDoseCalc']['engine']:
+          'SVPB'   — SVD photon pencil beam (default)
+          'ompMC'  — ompMC-style TERMA + scatter engine
+          'TOPAS'  — TOPAS Geant4 MC (requires TOPAS binary)
+        """
         radiation_mode = pln.get("radiationMode", "photons")
+        engine_name    = (
+            pln.get("propDoseCalc", {}).get("engine", "SVPB").upper()
+        )
+
         if radiation_mode == "photons":
-            from .photon_svd_engine import PhotonPencilBeamSVDEngine
-            return PhotonPencilBeamSVDEngine(pln)
+            if engine_name in ("SVPB", "SVDPB", "SVD"):
+                from .photon_svd_engine import PhotonPencilBeamSVDEngine
+                return PhotonPencilBeamSVDEngine(pln)
+            elif engine_name in ("OMPC", "OMPMC"):
+                from .photon_ompc_engine import PhotonOmpMCEngine
+                return PhotonOmpMCEngine(pln)
+            elif engine_name == "TOPAS":
+                from .topas_mc_engine import TopasMCEngine
+                return TopasMCEngine(pln)
+            else:
+                raise NotImplementedError(
+                    f"Unknown engine '{engine_name}' for photons. "
+                    "Choose 'SVPB', 'ompMC', or 'TOPAS'."
+                )
         else:
-            raise NotImplementedError(f"Dose engine for '{radiation_mode}' not implemented")
+            raise NotImplementedError(
+                f"Dose engine for '{radiation_mode}' not implemented"
+            )
