@@ -24,12 +24,14 @@ For a full per-bixel dij, set pln['propDoseCalc']['calcDij'] = True — this
 runs one TOPAS simulation per bixel (much slower).
 """
 
+import io
 import os
 import struct
 import subprocess
 import tempfile
 import shutil
 import time
+import zipfile
 import numpy as np
 import scipy.sparse as sp
 from typing import Optional
@@ -123,12 +125,17 @@ class TopasMCEngine(DoseEngineBase):
 
     Parameters (pln['propDoseCalc'])
     --------------------------------
-    topasExec          : str   — path to TOPAS executable
+    topasExec          : str   — path to TOPAS executable (local mode)
     workingDir         : str   — folder for TOPAS files  (default: tmp dir)
     externalCalculation: str   — 'off' | 'write' | <result folder>
     numHistories       : int   — histories per beam
     numThreads         : int   — CPU threads (0 = auto)
     calcDij            : bool  — per-bixel dij (slow) vs total dose only
+    topasApiUrl        : str   — base URL of OpenTOPAS API server
+                                 (e.g. 'http://localhost:7778'); when set,
+                                 simulations run on the remote server instead
+                                 of a local TOPAS installation
+    topasApiToken      : str   — Bearer token for the API server
     """
 
     name       = "TOPAS"
@@ -153,6 +160,8 @@ class TopasMCEngine(DoseEngineBase):
         self.num_histories        = int(prop.get("numHistories", DEFAULT_N_HISTORIES))
         self.num_threads          = int(prop.get("numThreads",   DEFAULT_N_THREADS))
         self.calc_dij             = bool(prop.get("calcDij",     False))
+        self.topas_api_url        = prop.get("topasApiUrl", "").rstrip("/")
+        self.topas_api_token      = prop.get("topasApiToken", "")
 
         self._tmp_dir_created = False
 
@@ -208,9 +217,10 @@ class TopasMCEngine(DoseEngineBase):
         ct = get_world_axes(ct)
         ct = self._calc_water_eq_density(ct)
 
-        # ---- validate TOPAS is reachable (unless read-only mode) ----------
+        # ---- validate TOPAS is reachable (unless read-only or API mode) ----
         mode = self.external_calculation
-        if mode not in ("write",) and not os.path.isdir(str(mode)):
+        if mode not in ("write",) and not os.path.isdir(str(mode)) \
+                and not self.topas_api_url:
             topas_ok = shutil.which(self.topas_exec) is not None
             if not topas_ok:
                 raise RuntimeError(
@@ -276,7 +286,8 @@ class TopasMCEngine(DoseEngineBase):
         _write_ct_binary(dat_path, hu_cube)
 
     def _write_beam_file(self, beam: dict, beam_idx: int, out_path: str,
-                         result_prefix: str, ct: dict, n_histories: int):
+                         result_prefix: str, ct: dict, n_histories: int,
+                         use_relative_paths: bool = False):
         """Write a self-contained TOPAS parameter file for one beam.
 
         All CT geometry parameters are inlined (no includeFile) because
@@ -303,6 +314,8 @@ class TopasMCEngine(DoseEngineBase):
 
         # TOPAS string parameters accept forward slashes on Windows.
         wd_fwd = self.working_dir.replace("\\", "/")
+        # In API mode all files are co-located in the server's job dir; use "./"
+        ct_dir = "./" if use_relative_paths else f"{wd_fwd}/"
         # Output file: relative name (TOPAS writes to its cwd = self.working_dir)
         rp_rel = os.path.basename(result_prefix)
 
@@ -318,7 +331,7 @@ class TopasMCEngine(DoseEngineBase):
             "# ---- Patient (CT geometry) -----------------------------------",
             "s:Ge/Patient/Type               = \"TsImageCube\"",
             "s:Ge/Patient/Parent             = \"World\"",
-            f"s:Ge/Patient/InputDirectory     = \"{wd_fwd}/\"",
+            f"s:Ge/Patient/InputDirectory     = \"{ct_dir}\"",
             "s:Ge/Patient/InputFile          = \"matRad_cube.dat\"",
             "s:Ge/Patient/ImagingToMaterialConverter = \"MaterialTagNumber\"",
             "iv:Ge/Patient/MaterialTagNumbers = 4 0 1 2 3",
@@ -399,6 +412,9 @@ class TopasMCEngine(DoseEngineBase):
         if self.external_calculation == "write":
             return None
 
+        if self.topas_api_url:
+            return self._run_beam_via_api(ct, beam, beam_idx)
+
         cfg.disp_info(f"    Running TOPAS for beam {beam_idx+1}...\n")
         cmd = [self.topas_exec, param_file]
 
@@ -458,6 +474,100 @@ class TopasMCEngine(DoseEngineBase):
             cube = self._run_beam(ct, single_beam, beam_idx * 10000 + ri)
             cubes.append(cube)
         return cubes
+
+    # ------------------------------------------------------------------
+    # API execution
+    # ------------------------------------------------------------------
+
+    def _run_beam_via_api(self, ct: dict, beam: dict,
+                          beam_idx: int) -> Optional[np.ndarray]:
+        """Submit a beam simulation to the OpenTOPAS REST API, wait for
+        completion, download the results zip, and return the dose cube."""
+        try:
+            import requests as _requests
+        except ImportError:
+            raise RuntimeError(
+                "The 'requests' package is required for API mode. "
+                "Install it with: pip install requests"
+            )
+
+        cfg = MatRad_Config.instance()
+
+        param_file    = os.path.join(self.working_dir, f"beam_{beam_idx:03d}.txt")
+        result_prefix = f"dose_beam{beam_idx:03d}"
+        ct_file       = os.path.join(self.working_dir, "matRad_cube.dat")
+
+        # Write param file with relative InputDirectory (files co-located on server)
+        self._write_beam_file(beam, beam_idx, param_file, result_prefix,
+                              ct, self.num_histories, use_relative_paths=True)
+
+        headers = {}
+        if self.topas_api_token:
+            headers["Authorization"] = f"Bearer {self.topas_api_token}"
+
+        # ── 1. Submit job ───────────────────────────────────────────────
+        cfg.disp_info(f"    Submitting beam {beam_idx+1} to {self.topas_api_url}...\n")
+        with open(param_file, "rb") as pf, open(ct_file, "rb") as cf:
+            resp = _requests.post(
+                f"{self.topas_api_url}/jobs",
+                files=[
+                    ("param_file",  (os.path.basename(param_file), pf, "text/plain")),
+                    ("input_files", ("matRad_cube.dat", cf, "application/octet-stream")),
+                ],
+                headers=headers,
+                timeout=60,
+            )
+        resp.raise_for_status()
+        job_id = resp.json()["job_id"]
+        cfg.disp_info(f"    Job {job_id} queued.\n")
+
+        # ── 2. Poll until done ──────────────────────────────────────────
+        while True:
+            time.sleep(5)
+            poll = _requests.get(
+                f"{self.topas_api_url}/jobs/{job_id}",
+                headers=headers,
+                timeout=10,
+            )
+            poll.raise_for_status()
+            status = poll.json()["status"]
+            cfg.disp_info(f"    Job {job_id}: {status}\n")
+            if status in ("done", "failed", "cancelled"):
+                break
+
+        if status != "done":
+            cfg.disp_warning(
+                f"TOPAS API job {job_id} ended with status '{status}'."
+            )
+            return None
+
+        # ── 3. Download results zip to a temp file ──────────────────────
+        cfg.disp_info(f"    Downloading results for job {job_id}...\n")
+        dl = _requests.get(
+            f"{self.topas_api_url}/jobs/{job_id}/results",
+            headers=headers,
+            timeout=300,
+            stream=True,
+        )
+        dl.raise_for_status()
+
+        tmp_fd, tmp_zip = tempfile.mkstemp(suffix=".zip")
+        os.close(tmp_fd)
+        try:
+            with open(tmp_zip, "wb") as f:
+                for chunk in dl.iter_content(chunk_size=1024 * 1024):
+                    f.write(chunk)
+            with zipfile.ZipFile(tmp_zip) as zf:
+                for member in zf.namelist():
+                    if member.endswith((".bin", ".binheader", ".log")):
+                        zf.extract(member, self.working_dir)
+        finally:
+            os.unlink(tmp_zip)
+
+        # ── 4. Read dose ────────────────────────────────────────────────
+        hdr = os.path.join(self.working_dir, result_prefix + ".binheader")
+        dat = os.path.join(self.working_dir, result_prefix + ".bin")
+        return _read_topas_dose_binary(hdr, dat)
 
     # ------------------------------------------------------------------
     # Result reading (external calculation)
