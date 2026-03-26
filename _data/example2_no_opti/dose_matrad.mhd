@@ -1,0 +1,14 @@
+ObjectType = Image
+NDims = 3
+BinaryData = True
+BinaryDataByteOrderMSB = False
+CompressedData = True
+CompressedDataSize = 1209831
+TransformMatrix = 1 0 0 0 1 0 0 0 1
+Offset = -250 -250 -160
+CenterOfRotation = 0 0 0
+AnatomicalOrientation = RAI
+ElementSpacing = 3 3 3
+DimSize = 167 167 107
+ElementType = MET_FLOAT
+ElementDataFile = dose_matrad.zraw
