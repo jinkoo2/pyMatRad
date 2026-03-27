@@ -80,8 +80,11 @@ def _read_topas_dose_binary(header_path: str, data_path: str) -> Optional[np.nda
     """
     Read a TOPAS scored binary dose file.
 
-    TOPAS binary scorer output: float32 array, dimensions from .binheader.
+    Supports both TOPAS 3.x ('Bins In X: N') and TOPAS 4.x
+    ('# X in N bins of M cm') header formats, and both float32 (3.x)
+    and float64 (4.x) binary layouts.
     """
+    import re
     if not os.path.exists(header_path) or not os.path.exists(data_path):
         return None
 
@@ -89,26 +92,45 @@ def _read_topas_dose_binary(header_path: str, data_path: str) -> Optional[np.nda
     with open(header_path, "r") as fh:
         for line in fh:
             l = line.strip()
+            # TOPAS 4.x: "# X in 200 bins of 0.2 cm"
+            m = re.match(r"#\s*X in (\d+) bins", l)
+            if m:
+                nx = int(m.group(1)); continue
+            m = re.match(r"#\s*Y in (\d+) bins", l)
+            if m:
+                ny = int(m.group(1)); continue
+            m = re.match(r"#\s*Z in (\d+) bins", l)
+            if m:
+                nz = int(m.group(1)); continue
+            # TOPAS 3.x: "Bins In X: 200"
             if l.startswith("Bins In X:"):
-                nx = int(l.split(":")[1])
-            elif l.startswith("Bins In Y:"):
-                ny = int(l.split(":")[1])
-            elif l.startswith("Bins In Z:"):
-                nz = int(l.split(":")[1])
+                nx = int(l.split(":")[1]); continue
+            if l.startswith("Bins In Y:"):
+                ny = int(l.split(":")[1]); continue
+            if l.startswith("Bins In Z:"):
+                nz = int(l.split(":")[1]); continue
 
     if None in (nx, ny, nz):
         return None
 
     n_vox = nx * ny * nz
     with open(data_path, "rb") as fd:
-        data = np.frombuffer(fd.read(n_vox * 4), dtype=np.float32)
+        raw = fd.read()
 
-    if len(data) < n_vox:
+    n_bytes = len(raw)
+    if n_bytes >= n_vox * 8:
+        # TOPAS 4.x writes float64
+        data = np.frombuffer(raw[:n_vox * 8], dtype=np.float64)
+    elif n_bytes >= n_vox * 4:
+        # TOPAS 3.x writes float32
+        data = np.frombuffer(raw[:n_vox * 4], dtype=np.float32).astype(np.float64)
+    else:
         return None
 
-    # TOPAS writes in C order (X-fastest → reshape as (Nz,Ny,Nx) then transpose)
-    cube = data[:n_vox].reshape((nz, ny, nx)).transpose(2, 1, 0)  # → (Nx,Ny,Nz)
-    # Convert to matRad order (Ny,Nx,Nz)
+    # TOPAS TsImageCube scores with X innermost (X varies fastest):
+    # flat index = ix + iy*nx + iz*nx*ny → reshape (nz, ny, nx)
+    cube = data.reshape((nz, ny, nx)).transpose(2, 1, 0)  # → (Nx, Ny, Nz)
+    # Convert to matRad order (Ny, Nx, Nz)
     return cube.transpose(1, 0, 2)   # (Ny, Nx, Nz)
 
 
@@ -319,6 +341,25 @@ class TopasMCEngine(DoseEngineBase):
         # Output file: relative name (TOPAS writes to its cwd = self.working_dir)
         rp_rel = os.path.basename(result_prefix)
 
+        # ---- Nozzle orientation --------------------------------------------
+        # In OpenTOPAS 4.x, Beam sources fire along the component's -Z axis.
+        # Compute RotX / RotY so that the nozzle's -Z points from the source
+        # toward the isocenter:
+        #   R_x(RotX) * R_y(RotY) * (0,0,-1) = normalize(-src_world)
+        sad = float(np.linalg.norm(src_world))
+        d = -src_world / sad          # unit vector: source → isocenter
+        dx, dy, dz = float(d[0]), float(d[1]), float(d[2])
+        rot_y = float(np.degrees(np.arctan2(-dx, np.sqrt(dy*dy + dz*dz))))
+        rot_x = float(np.degrees(np.arctan2(dy, -dz)))
+
+        # Angular half-width of the field at isocenter.
+        # Use actual bixel BEV positions (x and z are lateral in BEV).
+        ray_pos_bev = np.array([r["rayPos_bev"] for r in rays])  # (N,3)
+        bixel_width = float(beam.get("bixelWidth", 5.0))
+        max_lat = float(np.max(np.abs(ray_pos_bev[:, [0, 2]])))
+        field_half = max_lat + bixel_width / 2.0        # mm at isocenter
+        half_angle = float(np.degrees(np.arctan(field_half / sad)))  # deg
+
         lines = [
             f"# TOPAS beam {beam_idx+1}: gantry={ga}°  couch={ca}°",
             "",
@@ -343,9 +384,9 @@ class TopasMCEngine(DoseEngineBase):
             f"d:Ge/Patient/VoxelSizeX         = {rx:.4f} mm",
             f"d:Ge/Patient/VoxelSizeY         = {ry:.4f} mm",
             f"d:Ge/Patient/VoxelSizeZ         = {rz:.4f} mm",
-            f"d:Ge/Patient/TransX             = {x0 + nx*rx/2.0:.4f} mm",
-            f"d:Ge/Patient/TransY             = {y0 + ny*ry/2.0:.4f} mm",
-            f"d:Ge/Patient/TransZ             = {z0 + nz*rz/2.0:.4f} mm",
+            f"d:Ge/Patient/TransX             = {x0 + rx*(nx-1)/2.0:.4f} mm",
+            f"d:Ge/Patient/TransY             = {y0 + ry*(ny-1)/2.0:.4f} mm",
+            f"d:Ge/Patient/TransZ             = {z0 + rz*(nz-1)/2.0:.4f} mm",
             "",
             "# ---- Beam nozzle (virtual source) ----------------------------",
             "s:Ge/Nozzle/Type      = \"Group\"",
@@ -353,19 +394,23 @@ class TopasMCEngine(DoseEngineBase):
             f"d:Ge/Nozzle/TransX    = {src_world[0]:.4f} mm",
             f"d:Ge/Nozzle/TransY    = {src_world[1]:.4f} mm",
             f"d:Ge/Nozzle/TransZ    = {src_world[2]:.4f} mm",
-            f"d:Ge/Nozzle/RotX      = {ga:.4f} deg",
-            f"d:Ge/Nozzle/RotY      = {ca:.4f} deg",
+            f"d:Ge/Nozzle/RotX      = {rot_x:.4f} deg",
+            f"d:Ge/Nozzle/RotY      = {rot_y:.4f} deg",
             f"d:Ge/Nozzle/RotZ      = 0 deg",
             "",
-            "# ---- Source: flat photon beam (one field covering all bixels) -",
+            "# ---- Source: divergent photon beam (point source at nozzle) --",
+            "# Particles fire from the nozzle origin along its -Z axis with a",
+            "# flat angular spread sized to cover the full bixel field.",
             "s:So/Photon/Type            = \"Beam\"",
             "s:So/Photon/Component       = \"Nozzle\"",
             "s:So/Photon/BeamParticle    = \"gamma\"",
             f"d:So/Photon/BeamEnergy      = {DEFAULT_ENERGY_MV:.1f} MeV",
             "u:So/Photon/BeamEnergySpread = 0",
-            "s:So/Photon/BeamShape       = \"Rectangle\"",
-            f"d:So/Photon/BeamFlatteningHalfWidth = {n_bixels * 5.0 / 2.0:.1f} mm",
-            f"d:So/Photon/BeamFlatteningHalfHeight = {n_bixels * 5.0 / 2.0:.1f} mm",
+            "s:So/Photon/BeamPositionDistribution = \"None\"",
+            "s:So/Photon/BeamAngularDistribution  = \"Flat\"",
+            "s:So/Photon/BeamAngularCutoffShape   = \"Rectangle\"",
+            f"d:So/Photon/BeamAngularCutoffX = {half_angle:.4f} deg",
+            f"d:So/Photon/BeamAngularCutoffY = {half_angle:.4f} deg",
             f"i:So/Photon/NumberOfHistoriesInRun = {n_histories}",
             "",
             "# ---- Scorer --------------------------------------------------",
@@ -382,7 +427,7 @@ class TopasMCEngine(DoseEngineBase):
             "# ---- Run control ---------------------------------------------",
             "i:Ts/Seed = 97",
             # Geant4 prebuilt is single-threaded; clamp to 1 to avoid MT RunManager
-            f"i:Ts/NumberOfThreads = {max(self.num_threads, 1)}",
+            f"i:Ts/NumberOfThreads = {self.num_threads}",
             "b:Ts/ShowCPUTime = \"True\"",
         ]
         # Prepend G4 data directory so TOPAS sets all G4xxxDATA env vars
@@ -693,7 +738,10 @@ class TopasMCEngine(DoseEngineBase):
             method="linear", bounds_error=False, fill_value=0.0,
         )
 
-        # Sample at dose-grid valid voxel world coordinates
-        pts = self._vox_world_coords_dose_grid   # (N, 3)
-        dose_at_vox = interp(pts)
+        # Sample at dose-grid valid voxel world coordinates.
+        # _vox_world_coords_dose_grid columns are (x, y, z); the interpolator
+        # axes are (y_ct, x_ct, z_ct), so reorder to (y, x, z).
+        pts = self._vox_world_coords_dose_grid   # (N, 3): (x, y, z)
+        pts_yxz = pts[:, [1, 0, 2]]             # → (y, x, z) to match axes
+        dose_at_vox = interp(pts_yxz)
         return np.maximum(dose_at_vox, 0.0)
