@@ -41,7 +41,7 @@ def load_machine(pln: dict, matrad_src_root: Optional[str] = None) -> dict:
     if radiation_mode is None:
         cfg.disp_error("No radiation mode given in pln")
 
-    file_name = f"{radiation_mode}_{machine_name}.mat"
+    base_name = f"{radiation_mode}_{machine_name}"
 
     # Build search paths
     pymatrad_root = os.path.dirname(os.path.dirname(os.path.dirname(
@@ -53,22 +53,34 @@ def load_machine(pln: dict, matrad_src_root: Optional[str] = None) -> dict:
     matrad_basedata = os.path.join(matrad_root, "matRad", "basedata")
     pymatrad_userdata = os.path.join(pymatrad_root, "userdata", "machines")
 
-    search_paths = [matrad_basedata, pymatrad_userdata]
+    # Search order: userdata first (custom machines override Generic),
+    # then the original MATLAB basedata.
+    # Within each folder prefer .npy (native Python) over .mat.
+    search_paths = [pymatrad_userdata, matrad_basedata]
 
-    # Find file
-    filepath = None
+    filepath  = None
+    file_name = None
     for folder in search_paths:
-        candidate = os.path.join(folder, file_name)
-        if os.path.isfile(candidate):
-            filepath = candidate
+        for ext in (".npy", ".mat"):
+            candidate = os.path.join(folder, base_name + ext)
+            if os.path.isfile(candidate):
+                filepath  = candidate
+                file_name = base_name + ext
+                break
+        if filepath is not None:
             break
 
     if filepath is None:
-        cfg.disp_error(f"Could not find machine file: {file_name}")
+        cfg.disp_error(
+            f"Could not find machine file: {base_name}.npy or {base_name}.mat"
+        )
 
-    # Load .mat file
+    # Load
     try:
-        machine = _load_mat_machine(filepath)
+        if filepath.endswith(".npy"):
+            machine = np.load(filepath, allow_pickle=True).item()
+        else:
+            machine = _load_mat_machine(filepath)
     except Exception as e:
         cfg.disp_error(f"Could not load machine file {file_name}: {e}")
 
