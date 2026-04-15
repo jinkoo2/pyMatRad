@@ -10,8 +10,8 @@ import numpy as np
 import scipy.sparse as sp
 import h5py
 
-REF = r'C:\Users\jkim20\Desktop\projects\tps\pyMatRad\examples\_matRad_ref_outputs\example1\matRad_example1_ref.mat'
-
+#REF = r'C:\Users\jkim20\Desktop\projects\tps\pyMatRad\examples\_matRad_ref_outputs\example1\matRad_example1_ref.mat'
+REF = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'examples/_matRad_ref_outputs/example1/matRad_example1_ref.mat')
 # ============================================================
 # Helper
 # ============================================================

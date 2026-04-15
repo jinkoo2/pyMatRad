@@ -20,8 +20,10 @@ import h5py
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-REF_FILE  = r'C:\Users\jkim20\Desktop\projects\tps\pyMatRad\examples\_matRad_ref_outputs\example2\matRad_example2_ref.mat'
-TG119_MAT = r'C:\Users\jkim20\Desktop\projects\tps\matRad\matRad\phantoms\TG119.mat'
+#REF_FILE  = r'C:\Users\jkim20\Desktop\projects\tps\pyMatRad\examples\_matRad_ref_outputs\example2\matRad_example2_ref.mat'
+REF_FILE = r'.\examples\_matRad_ref_outputs\example2\matRad_example2_ref.mat'
+#TG119_MAT = r'C:\Users\jkim20\Desktop\projects\tps\matRad\matRad\phantoms\TG119.mat'
+TG119_MAT = r'.\matRad\phantoms\TG119.mat'
 
 # ============================================================
 # Helper functions for HDF5 MATLAB v7.3 reading
