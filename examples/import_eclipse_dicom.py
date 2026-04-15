@@ -47,46 +47,83 @@ def dose_comparison_plots(dose_eclipse: np.ndarray,
                           dose_matrad: np.ndarray,
                           ct: dict,
                           out_dir: str,
-                          plan_name: str):
-    """Save axial / coronal / sagittal dose comparison figures."""
+                          plan_name: str,
+                          iso_mm: np.ndarray = None):
+    """Save axial / coronal / sagittal dose comparison figures.
+
+    Slices pass through the isocenter (iso_mm [x,y,z] in mm).
+    Falls back to the dose-weighted centroid if iso_mm is None.
+    Each figure has three panels: Eclipse | pyMatRad | Difference.
+    """
     os.makedirs(out_dir, exist_ok=True)
-    Ny, Nx, Nz = ct["cubeDim"]
     x, y, z = ct["x"], ct["y"], ct["z"]
 
-    iy0 = Ny // 2
-    ix0 = Nx // 2
-    iz0 = Nz // 2
+    # Determine slice indices — prefer isocenter, fall back to dose centroid
+    if iso_mm is not None:
+        ix0 = int(np.argmin(np.abs(x - iso_mm[0])))
+        iy0 = int(np.argmin(np.abs(y - iso_mm[1])))
+        iz0 = int(np.argmin(np.abs(z - iso_mm[2])))
+        slice_label = f"iso ({iso_mm[0]:.0f}, {iso_mm[1]:.0f}, {iso_mm[2]:.0f}) mm"
+    else:
+        # Dose-weighted centroid of Eclipse dose
+        ref = dose_eclipse if dose_eclipse is not None else dose_matrad
+        total = ref.sum()
+        if total > 0:
+            Yg, Xg, Zg = np.meshgrid(y, x, z, indexing="ij")
+            iy0 = int(np.argmin(np.abs(y - (ref * Yg).sum() / total)))
+            ix0 = int(np.argmin(np.abs(x - (ref * Xg).sum() / total)))
+            iz0 = int(np.argmin(np.abs(z - (ref * Zg).sum() / total)))
+        else:
+            Ny, Nx, Nz = ct["cubeDim"]
+            iy0, ix0, iz0 = Ny // 2, Nx // 2, Nz // 2
+        slice_label = f"dose centroid ({x[ix0]:.0f}, {y[iy0]:.0f}, {z[iz0]:.0f}) mm"
 
-    vmax = max(dose_eclipse.max(), dose_matrad.max())
+    print(f"  Slice planes: {slice_label}")
+
+    vmax = max(dose_eclipse.max() if dose_eclipse is not None else 0,
+               dose_matrad.max())
 
     views = [
-        ("axial",    dose_eclipse[:, :, iz0],  dose_matrad[:, :, iz0],   x,  y, "x [mm]", "y [mm]"),
-        ("coronal",  dose_eclipse[iy0, :, :].T, dose_matrad[iy0, :, :].T, x,  z, "x [mm]", "z [mm]"),
-        ("sagittal", dose_eclipse[:, ix0, :].T, dose_matrad[:, ix0, :].T, y,  z, "y [mm]", "z [mm]"),
+        ("axial",
+         dose_eclipse[:, :, iz0] if dose_eclipse is not None else np.zeros_like(dose_matrad[:, :, iz0]),
+         dose_matrad[:, :, iz0],
+         x, y, "x [mm]", "y [mm]", f"axial  z = {z[iz0]:.0f} mm"),
+        ("coronal",
+         dose_eclipse[iy0, :, :].T if dose_eclipse is not None else np.zeros_like(dose_matrad[iy0, :, :].T),
+         dose_matrad[iy0, :, :].T,
+         x, z, "x [mm]", "z [mm]", f"coronal  y = {y[iy0]:.0f} mm"),
+        ("sagittal",
+         dose_eclipse[:, ix0, :].T if dose_eclipse is not None else np.zeros_like(dose_matrad[:, ix0, :].T),
+         dose_matrad[:, ix0, :].T,
+         y, z, "y [mm]", "z [mm]", f"sagittal  x = {x[ix0]:.0f} mm"),
     ]
 
-    for name, ec_slice, mr_slice, ax1, ax2, xlabel, ylabel in views:
+    for view_name, ec_slice, mr_slice, ax1, ax2, xlabel, ylabel, view_label in views:
         diff = mr_slice - ec_slice
         fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
         im0 = axes[0].imshow(ec_slice, origin="lower", vmin=0, vmax=vmax, cmap="jet",
                              extent=[ax1[0], ax1[-1], ax2[0], ax2[-1]], aspect="auto")
-        axes[0].set_title("Eclipse RTDose"); axes[0].set_xlabel(xlabel); axes[0].set_ylabel(ylabel)
+        axes[0].set_title("Eclipse RTDose")
+        axes[0].set_xlabel(xlabel); axes[0].set_ylabel(ylabel)
         plt.colorbar(im0, ax=axes[0], label="Gy")
 
         im1 = axes[1].imshow(mr_slice, origin="lower", vmin=0, vmax=vmax, cmap="jet",
                              extent=[ax1[0], ax1[-1], ax2[0], ax2[-1]], aspect="auto")
-        axes[1].set_title("pyMatRad dose"); axes[1].set_xlabel(xlabel)
+        axes[1].set_title("pyMatRad dose")
+        axes[1].set_xlabel(xlabel)
         plt.colorbar(im1, ax=axes[1], label="Gy")
 
         im2 = axes[2].imshow(diff, origin="lower", cmap="bwr",
                              vmin=-vmax * 0.1, vmax=vmax * 0.1,
                              extent=[ax1[0], ax1[-1], ax2[0], ax2[-1]], aspect="auto")
-        axes[2].set_title("Difference (matRad − Eclipse)"); axes[2].set_xlabel(xlabel)
+        axes[2].set_title("Difference (matRad − Eclipse)")
+        axes[2].set_xlabel(xlabel)
         plt.colorbar(im2, ax=axes[2], label="Gy")
 
-        fig.suptitle(f"{plan_name} — {name}")
+        fig.suptitle(f"{plan_name} — {view_label}")
         fig.tight_layout()
-        out = os.path.join(out_dir, f"{plan_name}_{name}.png")
+        out = os.path.join(out_dir, f"{plan_name}_{view_name}.png")
         fig.savefig(out, dpi=120)
         plt.close(fig)
         print(f"  Saved: {out}")
@@ -198,8 +235,10 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
 
         suffix = "_eclipse_fluence" if eclipse_fluence else "_reoptimised"
         out_dir = os.path.join(ROOT, "examples", "dicom_comparison_plots")
+        iso = pln["propStf"]["isoCenter"]
+        iso_mm = np.atleast_2d(iso)[0] if iso.ndim > 1 else iso
         dose_comparison_plots(dose_eclipse, dose_matrad, ct, out_dir,
-                              plan_name + suffix)
+                              plan_name + suffix, iso_mm=iso_mm)
     else:
         print("\nNo RTDose found — skipping comparison plots.")
 

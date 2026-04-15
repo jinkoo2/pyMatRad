@@ -114,7 +114,18 @@ Comparison PNG plots saved to `examples/dicom_comparison_plots/`:
 {plan}_{mode}_sagittal.png
 ```
 
-Each figure has three panels: Eclipse RTDose | pyMatRad dose | Difference (matRad − Eclipse).
+Each figure has three panels: **Eclipse RTDose | pyMatRad dose | Difference (matRad − Eclipse)**.
+
+Slices pass through the **isocenter** (read from `pln["propStf"]["isoCenter"]`),
+so you always see the high-dose region at the target.  The slice position is
+printed to the console and shown in each figure's title, e.g.:
+
+```
+coronal  y = -210 mm
+```
+
+If the isocenter is unavailable, the script falls back to the dose-weighted
+centroid of the Eclipse RTDose.
 
 ---
 
