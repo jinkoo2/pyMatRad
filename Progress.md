@@ -162,7 +162,16 @@ Derivation: measured ratio ompMC/SVPB = 1.503×10⁸ → divide effective calib 
 
 **Result**: ompMC/SVPB ratio = 0.998 (water), 0.991 (TG119). ompMC 2.7–3.3× faster than SVPB.
 
-### 16. CST Row Iteration in example2_no_opti.py
+### 16. `enableDijSampling` pln Setting Silently Ignored
+**Problem**: `pln["propDoseCalc"]["enableDijSampling"] = False` had no effect. `_assign_from_pln` in `dose_engine_base.py` only parsed `doseGrid` from `propDoseCalc`. `photon_svd_engine._init_dose_calc` only read `useCustomPrimaryPhotonFluence`. The engine always ran with `self.enable_dij_sampling = True` (constructor default), applying stochastic Dij sampling even when the caller explicitly disabled it. This caused noisy dose profiles, most visible at deep depths (30 cm) where more voxels fall in the scatter tail and are subject to random sampling.
+
+**Fix** (`matRad/doseCalc/DoseEngines/photon_svd_engine.py`):
+```python
+if "enableDijSampling" in prop_dc:
+    self.enable_dij_sampling = bool(prop_dc["enableDijSampling"])
+```
+
+### 17. CST Row Iteration in example2_no_opti.py
 **Problem**: `for row_m in cst_m.flat` iterates all 18 individual cells of the `(3,6)` scipy.io object array in C order, not the 3 rows. First `row_m` = `cst_m[0,0]` = int → `row_m[3]` fails.
 
 **Fix** (`examples/example2_no_opti.py`):

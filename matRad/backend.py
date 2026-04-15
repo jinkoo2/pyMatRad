@@ -11,12 +11,13 @@ Valid names: 'python', 'cython', 'cpp', 'c'
 
 import os
 import sys
+from typing import Optional
 
 _VALID_BACKENDS = ("python", "cython", "cpp", "c")
 _backend_name: str = "python"
 
 
-def _parse_cli() -> str | None:
+def _parse_cli() -> Optional[str]:
     """Return backend name from --backend <name> in sys.argv, or None."""
     argv = sys.argv[1:]
     for i, arg in enumerate(argv):

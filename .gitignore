@@ -21,3 +21,4 @@ venv/
 examples/_matRad_ref_outputs/
 *.mat
 *.png
+_venv/

@@ -115,6 +115,15 @@ def _calc_beam_worker(bundle):
     is_field_based        = bundle['is_field_based']
     field_width           = bundle['field_width']
     dij_sampling          = bundle['dij_sampling']
+    use_custom_pf         = bundle.get('use_custom_pf', False)
+    pf_data               = bundle.get('pf_data', None)
+
+    # Pre-parse primary fluence arrays once (avoid repeated attribute access)
+    if use_custom_pf and pf_data is not None and len(pf_data) >= 2:
+        _pf_r    = pf_data[:, 0]
+        _pf_vals = pf_data[:, 1]
+    else:
+        _pf_r = _pf_vals = None
 
     n_kernels = len(betas)
 
@@ -171,7 +180,19 @@ def _calc_beam_worker(bundle):
         sizes  = [len(r['vox_ix']) for r in active]
         chunks = np.split(all_dose, np.cumsum(sizes[:-1]))
         for r, chunk in zip(active, chunks):
-            r['dose'] = chunk
+            if _pf_r is not None:
+                # Scale by primary fluence at the ray's off-axis distance.
+                # Port of MATLAB initRay: Fx = Fpre .* Psi, where Psi is
+                # interp1(primaryFluence(:,1), primaryFluence(:,2), r).
+                # Since the bixel (few mm) is tiny vs the profile scale,
+                # Psi is constant across the bixel → equals pf(r_ray).
+                rp    = np.asarray(rays[r['ray_idx']]['rayPos_bev'])
+                r_ray = float(np.sqrt(rp[0] ** 2 + rp[2] ** 2))
+                pf_scale = float(np.interp(r_ray, _pf_r, _pf_vals,
+                                           left=_pf_vals[0], right=0.0))
+                r['dose'] = chunk * pf_scale
+            else:
+                r['dose'] = chunk
 
     # Phase 3: build COO return data
     bixelNums, rayNums = [], []
@@ -279,6 +300,13 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
         from ...basedata import load_machine
         self.machine = load_machine(pln)
         machine_data = self.machine.get("data", {})
+
+        # Read propDoseCalc settings from pln
+        prop_dc = pln.get("propDoseCalc", {})
+        if "useCustomPrimaryPhotonFluence" in prop_dc:
+            self.use_custom_primary_photon_fluence = bool(prop_dc["useCustomPrimaryPhotonFluence"])
+        if "enableDijSampling" in prop_dc:
+            self.enable_dij_sampling = bool(prop_dc["enableDijSampling"])
         machine_meta = self.machine.get("meta", {})
 
         # Get penumbra FWHM
@@ -319,17 +347,17 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
 
         # Pre-compute fluence if uniform
         if not self.is_field_based_dose_calc:
-            field_limit = int(np.ceil(self._field_width / (2 * self.int_conv_resolution)))
             field_size = int(self._field_width / self.int_conv_resolution)
             self._Fpre = np.ones((field_size, field_size))
 
-            if not self.use_custom_primary_photon_fluence:
-                # Gaussian convolution for penumbra
-                s = (self._gauss_conv_size, self._gauss_conv_size)
-                self._Fpre = np.real(ifft2(
-                    fft2(self._Fpre, s=s) *
-                    fft2(self._gauss_filter, s=s)
-                ))
+            # Always apply Gaussian convolution for penumbra.
+            # When useCustomPrimaryPhotonFluence=True, per-ray primary fluence
+            # scaling (pf_scale) is applied later in the worker on top of this.
+            s = (self._gauss_conv_size, self._gauss_conv_size)
+            self._Fpre = np.real(ifft2(
+                fft2(self._Fpre, s=s) *
+                fft2(self._gauss_filter, s=s)
+            ))
 
         # Set effective lateral cutoff
         self._effective_lateral_cutoff = (
@@ -344,10 +372,8 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
         self._cube_wed = ct.get("cube", ct.get("cubeHU"))
         self._apply_outside_density_mask()
 
-        # Preallocate dij sparse matrix
-        n_voxels = dij["doseGrid"]["numOfVoxels"]
-        n_bixels = dij["totalNumOfBixels"]
-        dij["physicalDose"] = [sp.lil_matrix((n_voxels, n_bixels))]
+        # Placeholder — actual sparse matrix is assembled after worker completes
+        dij["physicalDose"] = [None]
 
         return dij
 
@@ -529,9 +555,9 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
                 k_mx = np.zeros_like(r_grid)
             self._kernel_mxs.append(k_mx)
 
-        # Pre-compute kernel convolution if uniform fluence
-        if self._Fpre is not None and not self.use_custom_primary_photon_fluence:
-            cfg.disp_info("    Uniform fluence -> pre-computing kernel convolution...\n")
+        # Pre-compute kernel convolution (always; pf_scale is applied per-ray in worker)
+        if self._Fpre is not None:
+            cfg.disp_info("    Pre-computing kernel convolution...\n")
             self._interp_kernel_cache = self._get_kernel_interpolators(self._Fpre)
 
         return beam
@@ -671,9 +697,7 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
             iso_lat_x = rot_coords[:, 0] * proj_factor
             iso_lat_z = rot_coords[:, 2] * proj_factor
 
-            ik = (self._get_kernel_interpolators(self._Fpre)
-                  if self.use_custom_primary_photon_fluence
-                  else self._interp_kernel_cache)
+            ik = self._interp_kernel_cache
 
             bundles.append({
                 "beam_idx":    beam_idx,
@@ -696,6 +720,10 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
                 "is_field_based":       self.is_field_based_dose_calc,
                 "field_width":          self._field_width,
                 "dij_sampling":         getattr(self, "dij_sampling", {}),
+                "use_custom_pf":        self.use_custom_primary_photon_fluence,
+                "pf_data":              np.asarray(
+                    self.machine["data"].get("primaryFluence", np.zeros((0, 2)))
+                ),
             })
 
         # ------------------------------------------------------------------ #
@@ -709,8 +737,12 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
             f"\nComputing dose for {len(stf)} beams "
             f"with {n_workers} parallel workers...\n"
         )
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            beam_results = list(pool.map(_calc_beam_worker, bundles))
+        if n_workers <= 1:
+            # Run in-process to avoid subprocess pickling overhead / OOM
+            beam_results = [_calc_beam_worker(b) for b in bundles]
+        else:
+            with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                beam_results = list(pool.map(_calc_beam_worker, bundles))
 
         # ------------------------------------------------------------------ #
         # Assemble COO data into a single CSC dose matrix                     #
