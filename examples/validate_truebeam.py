@@ -31,8 +31,8 @@ import scipy.io as sio
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-GBD_ROOT    = "/gpfs/projects/KimGroup/projects/tps/matRad/my_scripts/TrueBeamGBD"
-MATRAD_DIR  = "/gpfs/projects/KimGroup/projects/tps/matRad"
+GBD_ROOT    = os.path.join(ROOT, "..", "matRad", "my_scripts", "TrueBeamGBD")
+MATRAD_DIR  = os.path.join(ROOT, "..", "matRad")
 PLOT_DIR    = os.path.join(ROOT, "examples", "validation_plots")
 os.makedirs(PLOT_DIR, exist_ok=True)
 
@@ -93,18 +93,16 @@ FIELD_CONFIGS = {
         "mat_prefix":   "s8",
         "mat_suffix":   "10x10",
     },
-    
-    # commened out because killed from OOM.
-    # "20x20": {
-    #     "Nx": 200, "Ny": 160, "Nz": 200,
-    #     "target_half_mm": 100,
-    #     "bixelWidth": 5,
-    #     "dd_col_tag":   "20x20cm2",
-    #     "prof_col_tag": "Field Size: 20x20 cm2",
-    #     "mat_prefix":   "s9",
-    #     "mat_suffix":   "20x20",
-    # },
-    
+    "20x20": {
+        "Nx": 200, "Ny": 160, "Nz": 200,
+        "target_half_mm": 100,
+        "bixelWidth": 5,
+        "dd_col_tag":   "20x20cm2",
+        "prof_col_tag": "Field Size: 20x20 cm2",
+        "mat_prefix":   "s9",
+        "mat_suffix":   "20x20",
+    },
+
 }
 
 # Profile depths [cm]: first depth is energy-specific, rest are common
@@ -220,8 +218,15 @@ def build_water_phantom(Nx, Ny, Nz, res, target_half_mm, profile_depths_mm=None)
       z: [-Nz/2 .. Nz/2-1] * res   (laterally centred)
     cubeDim = [Ny, Nx, Nz]  (MATLAB/matRad convention)
 
-    Full VOI: all voxels are included in the dose grid for accurate
-    profile and PDD extraction at any depth.
+    Sparse VOI: only the voxels needed for PDD and profile extraction are
+    included, keeping the dose grid small (~200–1500 voxels) regardless of
+    phantom size.  This avoids the O(N_bixels * N_voxels) memory blow-up in
+    the SVD worker.
+
+    OAR (Water): central axis at (ix0, iz0) for all depths  +
+                 one x-slice per profile depth at iz0.
+    PTV:         thin slab at y≈5 mm covering the full field footprint —
+                 used by the STF generator to determine bixel placement.
     """
     x = (np.arange(Nx) - Nx // 2) * float(res)
     y = np.arange(Ny) * float(res)
@@ -236,17 +241,33 @@ def build_water_phantom(Nx, Ny, Nz, res, target_half_mm, profile_depths_mm=None)
         "cube":   [np.ones( (Ny, Nx, Nz), dtype=np.float32)],
     }
 
-    # ----- PTV: full 3D box from surface to 160mm depth, field footprint -----
+    ix0 = Nx // 2   # central x index (isocenter)
+    iz0 = Nz // 2   # central z index (isocenter)
+
+    def fv(iy, ix, iz):
+        """1-based Fortran-order linear index into the (Ny, Nx, Nz) array."""
+        return int(iy) + int(ix) * Ny + int(iz) * Ny * Nx + 1
+
+    # ----- OAR: central axis (PDD) + x-slices at each profile depth -----
+    oar_set = set()
+    for iy in range(Ny):                       # central axis for PDD
+        oar_set.add(fv(iy, ix0, iz0))
+    if profile_depths_mm is not None:
+        for d_mm in profile_depths_mm:         # full x-row at each profile depth
+            iy_d = int(np.argmin(np.abs(y - float(d_mm))))
+            for ix in range(Nx):
+                oar_set.add(fv(iy_d, ix, iz0))
+    V_oar = np.array(sorted(oar_set), dtype=np.int64)
+
+    # ----- PTV: thin slab at y≈5 mm for correct bixel placement -----
+    iy_ptv = max(1, int(round(5.0 / res)))
     ix_tgt = np.where((x >= -target_half_mm) & (x <= target_half_mm))[0]
     iz_tgt = np.where((z >= -target_half_mm) & (z <= target_half_mm))[0]
-    iy_tgt = np.arange(len(y))   # all depths
-    mask_ptv = np.zeros((Ny, Nx, Nz), dtype=bool)
-    iy_g, ix_g, iz_g = np.meshgrid(iy_tgt, ix_tgt, iz_tgt, indexing="ij")
-    mask_ptv[iy_g, ix_g, iz_g] = True
-    V_target = np.where(mask_ptv.ravel(order="F"))[0] + 1   # 1-based Fortran
-
-    # ----- OAR (Water): full phantom volume -----
-    V_oar = np.arange(1, Ny * Nx * Nz + 1, dtype=np.int64)
+    ptv_set = set()
+    for ix in ix_tgt:
+        for iz in iz_tgt:
+            ptv_set.add(fv(iy_ptv, ix, iz))
+    V_target = np.array(sorted(ptv_set), dtype=np.int64)
 
     meta_oar = {"Priority": 2, "Visible": 1, "visibleColor": [0, 0.5, 0],
                 "alphaX": 0.1, "betaX": 0.05, "TissueClass": 1}
@@ -275,7 +296,16 @@ def run_pymatrad(energy_name, field_cfg, verbose=True):
     bw = field_cfg["bixelWidth"]
     th = field_cfg["target_half_mm"]
 
-    ct, cst = build_water_phantom(Nx, Ny, Nz, RES, th)
+    depth_targets_cm = [d for d, _ in PROFILE_FILES_CM[energy_name]]
+    profile_depths_mm = [d * 10.0 for d in depth_targets_cm]
+
+    ct, cst = build_water_phantom(Nx, Ny, Nz, RES, th,
+                                  profile_depths_mm=profile_depths_mm)
+    n_oar = len(cst[0][3][0])
+    n_ptv = len(cst[1][3][0])
+    if verbose:
+        print(f"    VOI: OAR={n_oar} voxels, PTV={n_ptv} voxels "
+              f"(full grid={Ny*Nx*Nz/1e6:.2f}M)")
     ct = get_world_axes(ct)
 
     pln = {
@@ -295,6 +325,10 @@ def run_pymatrad(energy_name, field_cfg, verbose=True):
             "doseGrid": {"resolution": {"x": RES, "y": RES, "z": RES}},
             "useCustomPrimaryPhotonFluence": True,
             "enableDijSampling":            False,
+            # Water phantom: density = 1 everywhere. Do NOT zero out voxels
+            # outside the sparse VOI — that would corrupt radiological depths
+            # for off-axis voxels and produce a spike at x=0 in all profiles.
+            "ignoreOutsideDensities":       False,
         },
     }
 
@@ -338,7 +372,6 @@ def run_pymatrad(energy_name, field_cfg, verbose=True):
     pdd_norm = 100.0 * pdd_raw / pdd_max if pdd_max > 0 else pdd_raw
 
     # Profiles at specified depths
-    depth_targets_cm = [d for d, _ in PROFILE_FILES_CM[energy_name]]
     profiles_norm  = []
     depth_used_mm  = []
     for d_cm in depth_targets_cm:

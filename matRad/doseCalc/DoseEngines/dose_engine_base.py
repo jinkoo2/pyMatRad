@@ -75,6 +75,8 @@ class DoseEngineBase:
                 self.dose_grid["resolution"]["x"] = r.get("x", 3.0)
                 self.dose_grid["resolution"]["y"] = r.get("y", 3.0)
                 self.dose_grid["resolution"]["z"] = r.get("z", 3.0)
+        if "ignoreOutsideDensities" in prop:
+            self.ignore_outside_densities = bool(prop["ignoreOutsideDensities"])
 
     def calc_dose_influence(self, ct: dict, cst: list, stf: list) -> dict:
         """
