@@ -729,10 +729,17 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
         # ------------------------------------------------------------------ #
         # Parallel dose computation — one worker process per beam             #
         # ------------------------------------------------------------------ #
-        n_workers = min(
-            int(os.environ.get("PYMATRAD_WORKERS", os.cpu_count() or 1)),
-            len(stf),
-        )
+        # pln["propDoseCalc"]["numWorkers"] overrides the env variable
+        _pln_workers = None
+        if self._pln is not None:
+            _pln_workers = self._pln.get("propDoseCalc", {}).get("numWorkers", None)
+        if _pln_workers is not None:
+            n_workers = min(int(_pln_workers), len(stf))
+        else:
+            n_workers = min(
+                int(os.environ.get("PYMATRAD_WORKERS", os.cpu_count() or 1)),
+                len(stf),
+            )
         cfg.disp_info(
             f"\nComputing dose for {len(stf)} beams "
             f"with {n_workers} parallel workers...\n"
