@@ -41,6 +41,10 @@ python examples/import_eclipse_dicom.py --plan ap_IMRT --ct-dir ap_sMLC --no-dos
 # Finer bixel grid and dose grid
 python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence \
     --bixel-width 2.5 --dose-grid 3.0
+
+# Restrict dose calc to a 100×200×100 mm box around isocenter at 2.5 mm resolution
+python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence \
+    --roi-width-around-iso-mm 100 200 100 --dose-grid 2.5
 ```
 
 ---
@@ -55,6 +59,7 @@ python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence \
 | `--eclipse-fluence` | off | Use Eclipse MLC leaf sequences to reproduce Eclipse dose rather than re-optimising fluence from scratch. |
 | `--bixel-width MM` | `5.0` | Bixel side length in mm (square bixels). Independent of dose grid resolution. |
 | `--dose-grid MM` | `5.0` | Isotropic dose calculation grid resolution in mm. |
+| `--roi-width-around-iso-mm WX WY WZ` | — | Restrict dose calculation to a rectangular box centred on the isocenter. Supply three **total** widths in mm. `--roi-width-around-iso-mm 100 200 100` gives iso ± 50 mm in x, ± 100 mm in y, ± 50 mm in z. Omit to use the full CT extent. |
 | `--force` | off | Ignore all cached files and recompute from scratch. |
 | `--cache-root DIR` | `examples/cache/` | Root directory for cache files. |
 
@@ -64,8 +69,12 @@ python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence \
   Smaller values capture more detail in the fluence map but increase the number
   of columns in the dij matrix and slow dose calculation.
 - `--dose-grid` controls the spatial resolution of the dose cube output.
+- `--roi-width-around-iso-mm` limits the dose grid to a sub-volume of the CT,
+  which reduces memory use and speeds up `calc_dose_influence` significantly.
+  The voxel count is printed at run time, e.g.
+  `ROI: iso ± (50.0, 100.0, 50.0) mm  → 41×81×41 voxels`.
 
-Cache files include both values in the tag (`dg5.0mm_bw5.0mm`) so changing
+Cache files include both dose grid and bixel width in the tag (`dg5.0mm_bw5.0mm`) so changing
 either parameter automatically triggers a recompute.
 
 ---
@@ -316,16 +325,29 @@ pln["propDoseCalc"] = {
   invisible to Python (exit code −9) and caused the `BrokenProcessPool` error
   seen with the default multi-worker mode on clinical CT
 
-To use a finer grid or more workers, override on the command line:
+To use a finer grid, an ROI, or more workers, override on the command line:
 
 ```bash
+# Finer grid over the full CT
 python examples/import_eclipse_dicom.py --plan 7beam_IMRT \
     --eclipse-fluence --dose-grid 3.0 --bixel-width 2.5
+
+# ROI around isocenter — much faster, lower memory
+python examples/import_eclipse_dicom.py --plan 7beam_IMRT \
+    --eclipse-fluence --roi-width-around-iso-mm 100 200 100 --dose-grid 2.5
 ```
 
 or in code after import:
 
 ```python
-pln["propDoseCalc"]["doseGrid"] = {"resolution": {"x": 3.0, "y": 3.0, "z": 3.0}}
+import numpy as np
+iso = pln["propStf"]["isoCenter"]
+r = 2.5
+pln["propDoseCalc"]["doseGrid"] = {
+    "resolution": {"x": r, "y": r, "z": r},
+    "x": np.arange(iso[0] - 50, iso[0] + 50 + r*1e-6, r),
+    "y": np.arange(iso[1] - 100, iso[1] + 100 + r*1e-6, r),
+    "z": np.arange(iso[2] - 50, iso[2] + 50 + r*1e-6, r),
+}
 pln["propDoseCalc"]["numWorkers"] = 4
 ```
