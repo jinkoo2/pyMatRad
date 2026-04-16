@@ -567,44 +567,50 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
         Compute Source-to-Surface Distance for all rays.
         Port of matRad_computeSSD.m
         """
+        import sys
         ct = get_world_axes(ct)
         density_threshold = self.ssd_density_threshold
+        cfg = MatRad_Config.instance()
+
+        n_beams = len(stf)
+        total_rays = sum(len(b["ray"]) for b in stf)
+        rays_done = 0
+
+        # Use first CT scenario for SSD (same cube for all beams)
+        cube = (self._cube_wed[0]
+                if (isinstance(self._cube_wed, list) and len(self._cube_wed) > 0)
+                else ct["cube"][0])
 
         for beam_idx, beam in enumerate(stf):
+            n_rays = len(beam["ray"])
+            cfg.disp_info(
+                f"  SSD beam {beam_idx+1}/{n_beams}: "
+                f"gantry={beam['gantryAngle']}°  {n_rays} rays ...\n"
+            )
+
             iso_world = np.asarray(beam["isoCenter"])
             iso_cube = world_to_cube_coords(np.atleast_2d(iso_world), ct)[0]
-
-            # Use first CT scenario for SSD
-            cube = self._cube_wed[0] if (isinstance(self._cube_wed, list) and len(self._cube_wed) > 0) else ct["cube"][0]
+            source_point = np.asarray(beam["sourcePoint"])
 
             ray_pos_bev = []
             ssd_values = []
+            report_step = max(1, n_rays // 10)   # report every ~10%
 
             for j, ray in enumerate(beam["ray"]):
                 target_point = np.asarray(ray["targetPoint"])
-                source_point = np.asarray(beam["sourcePoint"])
 
-                _, _, rho, d12, _ = siddon_ray_tracer(
+                # Single Siddon call — alphas already returned as first value
+                alphas, _, rho, d12, _ = siddon_ray_tracer(
                     iso_cube, ct["resolution"],
                     source_point, target_point,
                     [cube]
                 )
 
                 if len(rho[0]) > 0:
-                    # Find first voxel where density > threshold
                     above_thresh = np.where(rho[0] > density_threshold)[0]
                     if len(above_thresh) > 0:
-                        # SSD = distance along ray to first surface intersection
-                        # Compute corresponding alpha
-                        alphas_tmp, _, _, _, _ = siddon_ray_tracer(
-                            iso_cube, ct["resolution"],
-                            source_point, target_point,
-                            [cube]
-                        )
-                        if len(alphas_tmp) > above_thresh[0]:
-                            ssd = float(d12 * alphas_tmp[above_thresh[0]])
-                        else:
-                            ssd = float(d12 * 0.5)
+                        idx = above_thresh[0]
+                        ssd = float(d12 * alphas[idx]) if idx < len(alphas) else float(d12 * 0.5)
                     else:
                         ssd = None
                 else:
@@ -612,12 +618,23 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
 
                 ray_pos_bev.append(ray["rayPos_bev"])
                 ssd_values.append(ssd)
+                rays_done += 1
 
-            # Fix missing SSDs with nearest neighbor
+                if (j + 1) % report_step == 0 or (j + 1) == n_rays:
+                    pct_beam  = 100 * (j + 1) / n_rays
+                    pct_total = 100 * rays_done / total_rays
+                    sys.stdout.write(
+                        f"\r    ray {j+1:4d}/{n_rays}  "
+                        f"beam {pct_beam:5.1f}%  total {pct_total:5.1f}%   "
+                    )
+                    sys.stdout.flush()
+
+            sys.stdout.write("\n")
+
+            # Fix missing SSDs with nearest neighbour
             ray_pos_arr = np.array(ray_pos_bev)
             for j, ssd in enumerate(ssd_values):
                 if ssd is None:
-                    # Find nearest ray with valid SSD
                     dists = np.sum((ray_pos_arr - ray_pos_arr[j]) ** 2, axis=1)
                     sorted_idx = np.argsort(dists)
                     for k in sorted_idx:
