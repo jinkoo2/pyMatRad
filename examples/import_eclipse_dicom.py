@@ -26,6 +26,7 @@ import os
 import sys
 import argparse
 import pickle
+import time
 import numpy as np
 import scipy.sparse as sp
 import matplotlib
@@ -350,6 +351,115 @@ def dose_line_profiles(dose_eclipse: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Timing and memory reporting
+# ---------------------------------------------------------------------------
+
+def _fmt_mb(n_bytes: float) -> str:
+    if n_bytes >= 1024**3:
+        return f"{n_bytes / 1024**3:.2f} GB"
+    return f"{n_bytes / 1024**2:.1f} MB"
+
+
+def _array_bytes(arr) -> int:
+    """Bytes used by a numpy array or scipy sparse matrix."""
+    if arr is None:
+        return 0
+    if sp.issparse(arr):
+        return arr.data.nbytes + arr.indices.nbytes + arr.indptr.nbytes
+    return int(np.asarray(arr).nbytes)
+
+
+def _print_memory_summary(ct, cst, pln, dose_eclipse, dij, stf, dose_matrad, w):
+    """Print a table of estimated in-memory sizes for all major objects."""
+    rows = []
+
+    # CT
+    Ny, Nx, Nz = ct["cubeDim"]
+    n_ct = Ny * Nx * Nz
+    ct_red_bytes  = _array_bytes(ct["cube"][0])
+    ct_hu_bytes   = _array_bytes(ct.get("cubeHU", [None])[0])
+    rows.append(("CT RED cube",
+                 f"{Ny}×{Nx}×{Nz} = {n_ct:,} vox  float32",
+                 ct_red_bytes))
+    rows.append(("CT HU cube",
+                 f"{Ny}×{Nx}×{Nz} = {n_ct:,} vox  float32",
+                 ct_hu_bytes))
+
+    # RTStruct
+    cst_bytes = sum(_array_bytes(row[3][0] if isinstance(row[3], list) else row[3])
+                    for row in cst)
+    rows.append(("RTStruct voxel indices",
+                 f"{len(cst)} structures  int64",
+                 cst_bytes))
+
+    # Eclipse RTDose
+    if dose_eclipse is not None:
+        rows.append(("Eclipse RTDose",
+                     f"{dose_eclipse.shape}  float32",
+                     _array_bytes(dose_eclipse)))
+
+    # STF
+    if stf is not None:
+        n_bixels = sum(b["totalNumOfBixels"] for b in stf)
+        rows.append(("STF",
+                     f"{len(stf)} beams  {n_bixels} bixels",
+                     0))   # negligible
+
+    # dij sparse matrix
+    if dij is not None:
+        mat = dij["physicalDose"][0]
+        dg  = dij["doseGrid"]
+        nd  = int(np.prod(dg["dimensions"]))
+        nb  = dij.get("totalNumOfBixels", mat.shape[1])
+        nnz = mat.nnz
+        dij_bytes = _array_bytes(mat)
+        rows.append(("dij sparse matrix",
+                     f"{nd:,} vox × {nb:,} bixels  nnz={nnz:,}  CSC float32",
+                     dij_bytes))
+
+    # Weight vector
+    if w is not None:
+        rows.append(("Weight vector w",
+                     f"{len(w):,} bixels  float64",
+                     _array_bytes(w)))
+
+    # Dose result
+    if dose_matrad is not None:
+        rows.append(("pyMatRad dose cube",
+                     f"{dose_matrad.shape}  float32",
+                     _array_bytes(dose_matrad)))
+
+    total = sum(b for _, _, b in rows)
+
+    col_w = max(len(r[0]) for r in rows)
+    print(f"\n{'─'*60}")
+    print(f"  Memory summary")
+    print(f"{'─'*60}")
+    for name, detail, nbytes in rows:
+        size_str = _fmt_mb(nbytes) if nbytes > 0 else "—"
+        print(f"  {name:<{col_w}}  {size_str:>8}  {detail}")
+    print(f"{'─'*60}")
+    print(f"  {'Total':<{col_w}}  {_fmt_mb(total):>8}")
+    print(f"{'─'*60}")
+
+
+def _print_timing_summary(timings: dict):
+    """Print a table of wall-clock times for each step."""
+    total = sum(timings.values())
+    col_w = max(len(k) for k in timings)
+    print(f"\n{'─'*50}")
+    print(f"  Execution times")
+    print(f"{'─'*50}")
+    for step, t in timings.items():
+        bar_len = int(round(t / max(timings.values()) * 20))
+        bar = "█" * bar_len
+        print(f"  {step:<{col_w}}  {t:7.1f} s  {bar}")
+    print(f"{'─'*50}")
+    print(f"  {'Total':<{col_w}}  {total:7.1f} s")
+    print(f"{'─'*50}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -376,7 +486,11 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
     print(f"  Plan: {plan_name}")
     print(f"{'='*60}")
 
+    timings = {}
+    t_total = time.perf_counter()
+
     # ── 1. Import DICOM ──────────────────────────────────────────────────
+    t0 = time.perf_counter()
     cached = None if force else load_import(plan_name, cache_root)
     if cached is not None:
         ct, cst, pln, dose_eclipse, dose_eclipse_grid, rtplan_file = (
@@ -390,6 +504,7 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
         rtplan_file = pln.get("_rtplan_file")
         save_import(plan_name, ct, cst, pln, dose_eclipse,
                     dose_eclipse_grid, cache_root)
+    timings["DICOM import"] = time.perf_counter() - t0
 
     print(f"\nStructures ({len(cst)}):")
     for row in cst:
@@ -409,6 +524,9 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
 
     if not calc_dose:
         print("\n--no-dose-calc specified, skipping.")
+        timings["total"] = time.perf_counter() - t_total
+        _print_memory_summary(ct, cst, pln, dose_eclipse, None, None, None, None)
+        _print_timing_summary(timings)
         return
 
     # ── 2. Set dose-calc options ─────────────────────────────────────────
@@ -477,6 +595,7 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
     dij, stf = (None, None) if force else load_dij(
         plan_name, cache_root, dose_grid_mm, bixel_width_mm, field_stf)
     if dij is None:
+        t0 = time.perf_counter()
         if eclipse_fluence:
             print("\nGenerating field-aperture beam geometry (STF from MLC jaws) ...")
             stf = matRad.dicom.stf_from_rtplan_aperture(
@@ -486,13 +605,19 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
             stf = matRad.generate_stf(ct, cst, pln)
         total_bixels = sum(b["totalNumOfBixels"] for b in stf)
         print(f"  {len(stf)} beams, {total_bixels} bixels total")
+        timings["STF generation"] = time.perf_counter() - t0
 
         print("\nCalculating dose influence matrix ...")
+        t0 = time.perf_counter()
         dij = matRad.calc_dose_influence(ct, cst, stf, pln)
+        timings["dij calc"] = time.perf_counter() - t0
         save_dij(plan_name, dij, stf, cache_root, dose_grid_mm, bixel_width_mm, field_stf)
     else:
         total_bixels = sum(b["totalNumOfBixels"] for b in stf)
         print(f"  {len(stf)} beams, {total_bixels} bixels total (from cache)")
+
+    # Memory summary after all major objects are loaded
+    _print_memory_summary(ct, cst, pln, dose_eclipse, dij, stf, None, None)
 
     mode = "eclipse_fluence" if eclipse_fluence else "reoptimised"
     dose_matrad, w_cached = (None, None) if force else load_result(plan_name, mode, cache_root, dose_grid_mm, bixel_width_mm)
@@ -501,19 +626,25 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
         if eclipse_fluence:
             # ── 5a. Reproduce Eclipse dose from MLC leaf sequences ────────
             print("\nImporting Eclipse MLC fluence ...")
+            t0 = time.perf_counter()
             w = matRad.dicom.import_rtplan_fluence(
                 plan_file, stf, machine=machine,
                 num_fractions=pln.get("numOfFractions", 1))
+            timings["MLC fluence import"] = time.perf_counter() - t0
             beam_mus = pln["propStf"]["beamMU"]
             print(f"  Weight vector: {len(w)} bixels  non-zero: {np.sum(w>0)}")
             print(f"  Total MU: {beam_mus.sum():.1f}  "
                   f"Total w: {w.sum():.3f}")
             print("\nComputing dose from Eclipse fluence ...")
+            t0 = time.perf_counter()
             result_matrad = matRad.calc_dose_direct(dij, w)
+            timings["dose calc (direct)"] = time.perf_counter() - t0
         else:
             # ── 5b. Independent matRad fluence optimisation ───────────────
             print("\nOptimising fluence ...")
+            t0 = time.perf_counter()
             result_matrad = matRad.fluence_optimization(dij, cst, pln)
+            timings["fluence optimisation"] = time.perf_counter() - t0
             w = result_matrad["w"]
 
         dose_matrad = result_matrad["physicalDose"]
@@ -578,6 +709,9 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
     else:
         print("\nNo RTDose found — skipping comparison plots.")
 
+    timings["total"] = time.perf_counter() - t_total
+    _print_memory_summary(ct, cst, pln, dose_eclipse, dij, stf, dose_matrad, w)
+    _print_timing_summary(timings)
     print(f"\nDone: {plan_name}")
 
 
