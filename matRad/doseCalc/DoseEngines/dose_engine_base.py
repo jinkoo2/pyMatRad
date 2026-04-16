@@ -75,6 +75,10 @@ class DoseEngineBase:
                 self.dose_grid["resolution"]["x"] = r.get("x", 3.0)
                 self.dose_grid["resolution"]["y"] = r.get("y", 3.0)
                 self.dose_grid["resolution"]["z"] = r.get("z", 3.0)
+            # Explicit coordinate arrays override the full-CT extent
+            for ax in ("x", "y", "z"):
+                if ax in dg:
+                    self.dose_grid[ax] = np.asarray(dg[ax], dtype=float)
         if "ignoreOutsideDensities" in prop:
             self.ignore_outside_densities = bool(prop["ignoreOutsideDensities"])
 
@@ -120,11 +124,22 @@ class DoseEngineBase:
         # Use tiny epsilon (not half-step) to match MATLAB's colon semantics: a:step:b
         # MATLAB stops at the last value <= b; using step/2 would add an extra point.
         _eps = dg_res["x"] * 1e-6
+
+        # If explicit coordinate arrays were supplied (e.g. ROI around isocenter),
+        # use them directly; otherwise span the full CT extent.
+        def _ax(name, ct_arr):
+            if name in self.dose_grid:
+                arr = self.dose_grid[name]
+                # Clip to CT extent so voxels outside the CT are never queried
+                ct_lo, ct_hi = ct_arr[0], ct_arr[-1]
+                return arr[(arr >= ct_lo - _eps) & (arr <= ct_hi + _eps)]
+            return np.arange(ct_arr[0], ct_arr[-1] + _eps, dg_res[name])
+
         dij["doseGrid"] = {
             "resolution": dg_res,
-            "x": np.arange(ct["x"][0], ct["x"][-1] + _eps, dg_res["x"]),
-            "y": np.arange(ct["y"][0], ct["y"][-1] + _eps, dg_res["y"]),
-            "z": np.arange(ct["z"][0], ct["z"][-1] + _eps, dg_res["z"]),
+            "x": _ax("x", ct["x"]),
+            "y": _ax("y", ct["y"]),
+            "z": _ax("z", ct["z"]),
         }
         dij["doseGrid"]["dimensions"] = np.array([
             len(dij["doseGrid"]["y"]),

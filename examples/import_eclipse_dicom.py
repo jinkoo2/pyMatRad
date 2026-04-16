@@ -356,7 +356,7 @@ def dose_line_profiles(dose_eclipse: np.ndarray,
 def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
         eclipse_fluence: bool = False, cache_root: str = DEFAULT_CACHE_ROOT,
         force: bool = False, dose_grid_mm: float = 5.0,
-        bixel_width_mm: float = 5.0):
+        bixel_width_mm: float = 5.0, roi_half_widths=None):
     plan_dir = os.path.join(SAMPLE_PLANS_ROOT, plan_name)
     if not os.path.isdir(plan_dir):
         print(f"ERROR: plan directory not found: {plan_dir}")
@@ -419,8 +419,28 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
     r = float(dose_grid_mm)
     bw = float(bixel_width_mm)
     print(f"  Dose grid: {r:.1f} mm isotropic  |  Bixel width: {bw:.1f} mm")
+
+    dose_grid_cfg = {"resolution": {"x": r, "y": r, "z": r}}
+
+    if roi_half_widths is not None:
+        dx, dy, dz = [float(v) for v in roi_half_widths]
+        iso = pln["propStf"]["isoCenter"]
+        iso = np.atleast_2d(iso)[0] if np.asarray(iso).ndim > 1 else np.asarray(iso)
+        _eps = r * 1e-6
+        dose_grid_cfg["x"] = np.arange(iso[0] - dx, iso[0] + dx + _eps, r)
+        dose_grid_cfg["y"] = np.arange(iso[1] - dy, iso[1] + dy + _eps, r)
+        dose_grid_cfg["z"] = np.arange(iso[2] - dz, iso[2] + dz + _eps, r)
+        print(f"  ROI: iso ± ({dx:.1f}, {dy:.1f}, {dz:.1f}) mm  "
+              f"→ {len(dose_grid_cfg['x'])}×{len(dose_grid_cfg['y'])}×{len(dose_grid_cfg['z'])} voxels")
+    else:
+        Ny, Nx, Nz = ct["cubeDim"]
+        nx = int(np.ceil((ct["x"][-1] - ct["x"][0]) / r)) + 1
+        ny = int(np.ceil((ct["y"][-1] - ct["y"][0]) / r)) + 1
+        nz = int(np.ceil((ct["z"][-1] - ct["z"][0]) / r)) + 1
+        print(f"  ROI: full CT  → ~{ny}×{nx}×{nz} voxels")
+
     pln["propDoseCalc"].update({
-        "doseGrid":              {"resolution": {"x": r, "y": r, "z": r}},
+        "doseGrid":              dose_grid_cfg,
         "ignoreOutsideDensities": False,
         "numWorkers":            1,
     })
@@ -584,9 +604,16 @@ if __name__ == "__main__":
                         help="Bixel (pencil beam) width in mm at isocenter (default: 5.0). "
                              "Controls the lateral BEV ray spacing during STF generation. "
                              "Each bixel width gets its own dij/result cache entry.")
+    parser.add_argument("--roi", type=float, nargs=3, default=None,
+                        metavar=("DX", "DY", "DZ"),
+                        help="Restrict dose calculation to a rectangular ROI centred on "
+                             "the isocenter.  Supply three half-widths in mm, e.g. "
+                             "--roi 50 100 50 gives ±50 mm in x, ±100 mm in y, ±50 mm in z. "
+                             "Omit to use the full CT extent.")
     args = parser.parse_args()
 
     run(args.plan, ct_dir=args.ct_dir, calc_dose=not args.no_dose_calc,
         eclipse_fluence=args.eclipse_fluence,
         cache_root=args.cache_dir, force=args.force,
-        dose_grid_mm=args.dose_grid, bixel_width_mm=args.bixel_width)
+        dose_grid_mm=args.dose_grid, bixel_width_mm=args.bixel_width,
+        roi_half_widths=args.roi)
