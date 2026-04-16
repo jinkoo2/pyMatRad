@@ -1,6 +1,6 @@
 # pyMatRad Development Progress
 
-## Status (2026-03-23): All three engines working. 4.3× SVPB speedup. ompMC calibrated to <1% of SVPB.
+## Status (2026-04-16): VMAT arc STF generation ported. Arc STF + propVMAT metadata verified on TG119.
 
 ---
 
@@ -22,7 +22,8 @@
 | `matRad/rayTracing/_backends/siddon_cython.pyx` | ✅ compiled | Cython backend |
 | `matRad/rayTracing/_backends/siddon_cpp/` | ✅ compiled | pybind11 C++ backend |
 | `matRad/rayTracing/_backends/siddon_c/` | ✅ compiled | Plain C + ctypes backend |
-| `matRad/steering/stf_generator.py` | ✅ bug fixed | STF generator for photon IMRT |
+| `matRad/steering/stf_generator.py` | ✅ bug fixed | STF generator for photon IMRT; routes 'PhotonVMAT' to VMAT generator |
+| `matRad/steering/stf_generator_vmat.py` | ✅ | VMAT arc STF generator (StfGeneratorPhotonVMAT) |
 | `matRad/doseCalc/DoseEngines/dose_engine_base.py` | ✅ | Base dose engine |
 | `matRad/doseCalc/DoseEngines/photon_svd_engine.py` | ✅ bug fixed, parallel | SVD photon dose engine |
 | `matRad/doseCalc/DoseEngines/photon_ompc_engine.py` | ✅ calibrated, parallel | Analytical ompMC engine |
@@ -42,6 +43,8 @@
 | `acceleration_plan.md` | ✅ | Documents all acceleration work and profiling results |
 | `requirements.txt` | ✅ | |
 | `CLAUDE.md` | ✅ | |
+| `examples/example8_photons_vmat.py` | ✅ | VMAT arc plan (FMO step; STF+dose+opt verified) |
+| `VMAT.md` | ✅ | VMAT architecture, usage, propVMAT field reference, status |
 
 ---
 

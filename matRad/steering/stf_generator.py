@@ -407,7 +407,12 @@ def generate_stf(ct: dict, cst: list, pln: dict) -> list:
 
     # Select appropriate generator
     if radiation_mode == "photons":
-        generator = StfGeneratorPhotonIMRT(pln)
+        generator_name = pln.get("propStf", {}).get("generator", "PhotonIMRT")
+        if generator_name == "PhotonVMAT":
+            from .stf_generator_vmat import StfGeneratorPhotonVMAT
+            generator = StfGeneratorPhotonVMAT(pln)
+        else:
+            generator = StfGeneratorPhotonIMRT(pln)
     else:
         raise NotImplementedError(f"STF generator for '{radiation_mode}' not implemented yet")
 
