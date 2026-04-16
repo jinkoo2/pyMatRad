@@ -530,10 +530,24 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
               f"({np.abs(diff[mask]).mean() / dose_eclipse_dg[mask].mean() * 100:.1f}%)")
         print(f"  Max  |diff|  : {np.abs(diff[mask]).max():.3f} Gy")
 
+        # Dose at isocenter
+        iso = pln["propStf"]["isoCenter"]
+        iso_mm = np.atleast_2d(iso)[0] if np.asarray(iso).ndim > 1 else np.asarray(iso)
+        ix_iso = int(np.argmin(np.abs(dg["x"] - iso_mm[0])))
+        iy_iso = int(np.argmin(np.abs(dg["y"] - iso_mm[1])))
+        iz_iso = int(np.argmin(np.abs(dg["z"] - iso_mm[2])))
+        d_ec  = float(dose_eclipse_dg[iy_iso, ix_iso, iz_iso])
+        d_mr  = float(dose_matrad    [iy_iso, ix_iso, iz_iso])
+        d_diff = d_mr - d_ec
+        pct = (d_diff / d_ec * 100) if d_ec > 0 else float("nan")
+        print(f"\nDose at isocenter  "
+              f"(x={dg['x'][ix_iso]:.1f}, y={dg['y'][iy_iso]:.1f}, z={dg['z'][iz_iso]:.1f} mm):")
+        print(f"  Eclipse          : {d_ec:.3f} Gy")
+        print(f"  {label:30s}: {d_mr:.3f} Gy")
+        print(f"  Diff (mr−ec)     : {d_diff:+.3f} Gy  ({pct:+.1f}%)")
+
         suffix = "_eclipse_fluence" if eclipse_fluence else "_reoptimised"
         out_dir = os.path.join(ROOT, "examples", "dicom_comparison_plots")
-        iso = pln["propStf"]["isoCenter"]
-        iso_mm = np.atleast_2d(iso)[0] if iso.ndim > 1 else iso
         dose_grid_dict = {"x": dg["x"], "y": dg["y"], "z": dg["z"],
                           "cubeDim": list(dose_matrad.shape)}
         dose_comparison_plots(dose_eclipse_dg, dose_matrad, dose_grid_dict, out_dir,
