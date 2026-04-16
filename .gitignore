@@ -22,3 +22,6 @@ examples/_matRad_ref_outputs/
 *.mat
 *.png
 _venv/
+
+# Cached dij matrices and dose results (large, machine-specific)
+examples/cache/

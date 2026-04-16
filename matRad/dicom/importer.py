@@ -472,22 +472,26 @@ def import_rtplan(rtplan_file: str, ct: dict) -> dict:
 # RTDose importer
 # ---------------------------------------------------------------------------
 
-def import_rtdose(rtdose_file: str, ct: dict) -> tuple:
-    """Import a DICOM RTDose file and interpolate it onto the CT grid.
+def import_rtdose(rtdose_file: str, ct: dict = None) -> tuple:
+    """Import a DICOM RTDose file on its native grid.
+
+    The dose cube is returned on the DICOM dose grid as-is — no interpolation
+    onto the CT grid.  Use the returned ``dose_grid`` coordinates when you later
+    want to resample onto another grid (e.g. the matRad dose calc grid).
 
     Parameters
     ----------
     rtdose_file : str
-    ct : dict
+    ct : dict, optional
+        Unused; kept for backwards-compatibility.
 
     Returns
     -------
     (dose_cube, dose_grid) where
-        dose_cube : ndarray (Ny, Nx, Nz) [Gy] on the CT grid
+        dose_cube : ndarray (Ny, Nx, Nz) [Gy] on the native DICOM dose grid
         dose_grid : dict with keys 'x', 'y', 'z', 'resolution'
     """
     import pydicom
-    from scipy.interpolate import RegularGridInterpolator
 
     ds = pydicom.dcmread(rtdose_file)
 
@@ -501,8 +505,8 @@ def import_rtdose(rtdose_file: str, ct: dict) -> tuple:
     dz_dose_raw = getattr(ds, "SliceThickness", None)
     dz_dose = float(dz_dose_raw) if dz_dose_raw is not None else 2.0
     if hasattr(ds, "GridFrameOffsetVector"):
-        offsets  = [float(v) for v in ds.GridFrameOffsetVector]
-        z_dose   = ipp[2] + np.array(offsets)
+        offsets = [float(v) for v in ds.GridFrameOffsetVector]
+        z_dose  = ipp[2] + np.array(offsets)
     else:
         n_frames = dose_raw.shape[0]
         z_dose   = ipp[2] + np.arange(n_frames) * dz_dose
@@ -513,31 +517,16 @@ def import_rtdose(rtdose_file: str, ct: dict) -> tuple:
 
     x_dose = ipp[0] + np.arange(Nx_dose) * dx_dose
     y_dose = ipp[1] + np.arange(Ny_dose) * dy_dose
-    # dose_raw[frame, row, col] = dose_raw[iz, iy, ix]
-    # shape for RegularGridInterpolator: axes (z, y, x) → data[iz, iy, ix]
-    dose_zyx = dose_raw   # already (Nz, Ny, Nx)
 
     dose_grid = {
         "x": x_dose, "y": y_dose, "z": z_dose,
         "resolution": {"x": dx_dose, "y": dy_dose, "z": dz_dose},
     }
 
-    # Interpolate onto CT grid
-    interp_fn = RegularGridInterpolator(
-        (z_dose, y_dose, x_dose), dose_zyx,
-        method="linear", bounds_error=False, fill_value=0.0,
-    )
+    # dose_raw[iz, iy, ix] → transpose to matRad convention (Ny, Nx, Nz)
+    dose_yxz = dose_raw.transpose(1, 2, 0)
 
-    x_ct, y_ct, z_ct = ct["x"], ct["y"], ct["z"]
-    Ny, Nx, Nz = ct["cubeDim"]
-    zg, yg, xg = np.meshgrid(z_ct, y_ct, x_ct, indexing="ij")
-    pts = np.column_stack([zg.ravel(), yg.ravel(), xg.ravel()])
-
-    # interpolated shape: (Nz*Ny*Nx,) → reshape to (Nz, Ny, Nx) → transpose to (Ny, Nx, Nz)
-    dose_ct = interp_fn(pts).reshape(Nz, Ny, Nx).transpose(1, 2, 0)
-    dose_ct = np.asfortranarray(dose_ct)
-
-    return dose_ct, dose_grid
+    return dose_yxz, dose_grid
 
 
 # ---------------------------------------------------------------------------
@@ -569,8 +558,8 @@ def import_dicom(dicom_dir: str,
         'ct'        — ct dict
         'cst'       — cst list (empty list if no RTSTRUCT found)
         'pln'       — pln dict (None if no RTPLAN found)
-        'dose'      — ndarray (Ny,Nx,Nz) [Gy] on CT grid (None if no RTDOSE)
-        'dose_grid' — dose grid dict (None if no RTDOSE)
+        'dose'      — ndarray (Ny,Nx,Nz) [Gy] on native DICOM dose grid (None if no RTDOSE)
+        'dose_grid' — native DICOM dose grid dict with 'x','y','z','resolution' (None if no RTDOSE)
     """
     if verbose:
         print(f"Scanning {dicom_dir} ...")
@@ -619,12 +608,35 @@ def import_dicom(dicom_dir: str,
                   + ", ".join(row[1] for row in cst[:6])
                   + ("..." if len(cst) > 6 else ""))
 
+        # Zero RED outside BODY contour
+        body_row = next(
+            (row for row in cst
+             if any(t in row[1].lower() for t in ("body", "external", "outer contour"))),
+            None
+        )
+        if body_row is not None:
+            Ny, Nx, Nz = ct["cubeDim"]
+            n_vox = Ny * Nx * Nz
+            body_idx = body_row[3][0]                    # 1-based linear indices
+            body_idx = body_idx[(body_idx >= 1) & (body_idx <= n_vox)] - 1  # clip + to 0-based
+            body_mask = np.zeros(n_vox, dtype=bool)
+            body_mask[body_idx] = True
+            body_mask_3d = body_mask.reshape((Ny, Nx, Nz), order="F")
+            ct["cube"][0][~body_mask_3d] = 0.0
+            if verbose:
+                n_zero = int((~body_mask_3d).sum())
+                print(f"  RED zeroed outside BODY ({n_zero} voxels, "
+                      f"{100.0 * n_zero / n_vox:.1f}%)")
+        elif verbose:
+            print("  No BODY/External structure found; RED unchanged outside patient.")
+
     # RTPlan
     pln = None
     if files["rtplan"]:
         if verbose:
             print("Importing RTPlan ...")
         pln = import_rtplan(files["rtplan"][0], ct)
+        pln["_rtplan_file"] = files["rtplan"][0]   # preserve path for fluence import
         if verbose:
             n = len(pln["propStf"]["gantryAngles"])
             angles = pln["propStf"]["gantryAngles"]
@@ -638,9 +650,11 @@ def import_dicom(dicom_dir: str,
     if files["rtdose"]:
         if verbose:
             print("Importing RTDose ...")
-        dose, dose_grid = import_rtdose(files["rtdose"][0], ct)
+        dose, dose_grid = import_rtdose(files["rtdose"][0])
         if verbose:
+            res = dose_grid["resolution"]
             print(f"  Dose cube: {dose.shape}  "
+                  f"res={res['x']:.2f}×{res['y']:.2f}×{res['z']:.2f} mm  "
                   f"max={dose.max():.3f} Gy  mean={dose[dose > 0].mean():.3f} Gy")
 
     return {
@@ -726,62 +740,166 @@ def _parse_beam_mlc(beam_ds) -> dict:
     }
 
 
+def _tg51_abs_calib(machine: dict, ssd_ref: float = 1000.0) -> float:
+    """Return the TG-51 absolute calibration factor [Gy/MU].
+
+    TG-51 reference conditions: 1 MU = 1 cGy at
+      - SSD   = ssd_ref (default 1000 mm = 100 cm)
+      - depth = d_max  (depth of dose maximum for a 10×10 cm field)
+      - field = 100×100 mm (10×10 cm)
+
+    **Preferred path** — numerical calibration stored by calibrate_truebeam.py:
+    If ``machine["meta"]["tg51"]`` exists and its ``ssd_ref_mm`` matches the
+    requested SSD, the stored ``abs_calib`` is returned directly.  This value
+    was derived from an actual pyMatRad dose calculation (water phantom,
+    10×10 field, SSD=100 cm) so it accounts for the full engine response.
+
+    **Fallback** — analytical inverse-square approximation:
+    If no stored calibration is found, the calibration is estimated from the
+    SVD depth-dose model and an inverse-square correction:
+
+        D_ref = (SAD / (ssd_ref + d_max))²
+        abs_calib = 0.01 Gy/MU / D_ref
+
+    This approximation overestimates the true factor by ~4–6% because it
+    assumes the engine delivers exactly TPR=1 at d_max for the 10×10 field.
+    Run ``examples/calibrate_truebeam.py`` to replace it with the numerical
+    value.
+
+    Parameters
+    ----------
+    machine  : machine dict from load_machine()
+    ssd_ref  : reference SSD [mm] for TG-51 (default 1000 mm)
+
+    Returns
+    -------
+    abs_calib : float, Gy/MU
+    """
+    meta = machine.get("meta", {})
+    data = machine.get("data", {})
+
+    # ── preferred: use numerically calibrated value stored in machine file ─
+    tg51 = meta.get("tg51", None)
+    if tg51 is not None:
+        stored_ssd = float(tg51.get("ssd_ref_mm", ssd_ref))
+        if abs(stored_ssd - ssd_ref) < 1.0:          # same SSD (within 1 mm)
+            return float(tg51["abs_calib"])
+
+    # ── fallback: analytical inverse-square approximation ─────────────────
+    SAD   = float(meta.get("SAD", data.get("SAD", 1000.0)))
+    m     = float(data.get("m", 0.03))               # mm⁻¹
+    betas = np.asarray(data.get("betas", [0.04, 0.15, 0.60])).ravel()
+
+    d_test = np.linspace(0.0, 50.0, 2000)            # mm
+    dd = np.zeros_like(d_test)
+    for beta in betas:
+        if abs(beta - m) > 1e-10:
+            dd += beta / (beta - m) * (np.exp(-m * d_test) - np.exp(-beta * d_test))
+        else:
+            dd += m * d_test * np.exp(-m * d_test)   # L'Hôpital limit
+    d_max = float(d_test[np.argmax(dd)])
+
+    geo_dist_ref = ssd_ref + d_max
+    inv_sq       = (SAD / geo_dist_ref) ** 2
+    return 0.01 / inv_sq   # Gy/MU  (≈4–6% high without numerical correction)
+
+
 def _fluence_at_bixels(mlc: dict, x_bev: np.ndarray, z_bev: np.ndarray,
-                        beam_mu: float, n_t: int = 30) -> np.ndarray:
-    """Compute fluence (MU) at each bixel centre (x_bev, z_bev) in BEV.
+                        beam_mu: float, abs_calib: float = 0.01,
+                        n_t: int = 30, bixel_width: float = 5.0) -> np.ndarray:
+    """Compute calibrated bixel weights at each bixel centre (x_bev, z_bev).
 
     The BEV axes map directly to MLC coordinates at the isocenter plane:
         x_bev  → MLC x  (leaf-opening direction, A/B banks)
         z_bev  → MLC y  (leaf-selection direction, along leaf width)
 
     For each CP transition i→i+1 the leaves move linearly from A_i→A_{i+1}
-    and B_i→B_{i+1}.  The open fraction at bixel x is estimated by sampling
-    t uniformly in [0,1] (n_t samples).
+    and B_i→B_{i+1}.  The open fraction accounts for **partial bixel overlap**
+    in both dimensions:
+
+    x-direction (leaf opening)
+        The fraction of the bixel width [x-bw/2, x+bw/2] that lies inside the
+        MLC opening [A_t, B_t] at time t, averaged over n_t samples:
+
+            x_open(t) = clip(min(x+bw/2, B_t) - max(x-bw/2, A_t), 0, bw) / bw
+
+    z-direction (leaf selection)
+        A bixel straddling two leaf rows gets a contribution from each row
+        weighted by the overlap fraction of the bixel height with that row:
+
+            z_weight[lp] = clip(min(z+bw/2, bounds[lp+1]) - max(z-bw/2, bounds[lp]),
+                                0, bw) / bw
+
+        The final open fraction is the dot product of z_weight and x_open over
+        all leaf pairs:
+
+            open_frac = sum_lp( z_weight[lp] * x_open_mean[lp] )
+
+    The returned weight is scaled so that calc_dose_direct returns Gy:
+
+        w[bixel] = open_frac × beam_MU × abs_calib
 
     Parameters
     ----------
-    mlc      : dict from _parse_beam_mlc
-    x_bev    : (N,) lateral BEV positions of bixels [mm]
-    z_bev    : (N,) cranio-caudal BEV positions of bixels [mm]
-    beam_mu  : total MU for this beam
-    n_t      : number of sub-samples per CP transition (default 30)
+    mlc         : dict from _parse_beam_mlc
+    x_bev       : (N,) lateral BEV positions of bixel centres [mm]
+    z_bev       : (N,) cranio-caudal BEV positions of bixel centres [mm]
+    beam_mu     : total MU for this beam
+    abs_calib   : absolute dose calibration [Gy/MU]
+    n_t         : number of sub-samples per CP transition (default 30)
+    bixel_width : square bixel side length [mm] (default 5.0)
 
     Returns
     -------
-    w : (N,) fluence in MU at each bixel centre
+    w : (N,) bixel weights in matRad dose units (Gy-calibrated)
     """
-    A         = mlc["A"]           # (n_cp, n_leaves)
+    A         = mlc["A"]           # (n_cp, n_lp)
     B         = mlc["B"]
     cum_w     = mlc["cum_w"]       # (n_cp,)
-    bounds    = mlc["leaf_bounds"] # (n_leaves+1,)
+    bounds    = mlc["leaf_bounds"] # (n_lp+1,)
     jaw_x     = mlc["jaw_x"]
     jaw_y     = mlc["jaw_y"]
     n_cp      = A.shape[0]
-    delta_w   = np.diff(cum_w)     # (n_cp-1,)
+    n_lp      = A.shape[1]
+    bw_half   = bixel_width * 0.5
+
+    # Normalize to [0,1] so the result is independent of whether Eclipse stores
+    # cumulative weights as a normalized fraction or as absolute MU values.
+    delta_w = np.diff(cum_w) / cum_w[-1]   # (n_cp-1,), sums to 1.0
 
     N = len(x_bev)
     fluence = np.zeros(N)
 
-    # For each bixel, determine its leaf-pair index (from z_bev)
-    # leaf_bounds are the y-edges of each leaf row
-    lp_idx = np.searchsorted(bounds, z_bev, side="right") - 1
-    lp_idx = np.clip(lp_idx, 0, A.shape[1] - 1)
-
-    # Apply jaw mask: bixels outside jaws get zero fluence
+    # Active bixels: those whose extent overlaps the jaw and leaf boundary range.
+    # Expand jaw check by half bixel width so edge bixels aren't excluded.
     jaw_mask = (
-        (x_bev >= jaw_x[0]) & (x_bev <= jaw_x[1]) &
-        (z_bev >= jaw_y[0]) & (z_bev <= jaw_y[1])
+        (x_bev >= jaw_x[0] - bw_half) & (x_bev <= jaw_x[1] + bw_half) &
+        (z_bev >= jaw_y[0] - bw_half) & (z_bev <= jaw_y[1] + bw_half) &
+        (z_bev >= bounds[0]  - bw_half) & (z_bev <= bounds[-1] + bw_half)
     )
-
-    # Also mask bixels outside the leaf boundary range
-    jaw_mask &= (z_bev >= bounds[0]) & (z_bev <= bounds[-1])
 
     active = np.where(jaw_mask)[0]
     if len(active) == 0:
         return fluence
 
-    x_a  = x_bev[active]          # (n_active,)
-    lp_a = lp_idx[active]         # (n_active,) leaf-pair indices
+    x_a = x_bev[active]   # (n_active,)
+    z_a = z_bev[active]
+
+    # ── z-direction partial overlap ──────────────────────────────────────────
+    # z_weights[b, lp] = fraction of bixel b's height covered by leaf pair lp
+    # Shape: (n_active, n_lp)
+    bix_z_lo = z_a - bw_half       # (n_active,)
+    bix_z_hi = z_a + bw_half
+    lp_lo = bounds[:-1]            # (n_lp,)
+    lp_hi = bounds[1:]
+    z_weights = np.maximum(0.0,
+        np.minimum(bix_z_hi[:, None], lp_hi[None, :]) -
+        np.maximum(bix_z_lo[:, None], lp_lo[None, :])
+    ) / bixel_width                # (n_active, n_lp)
+
+    # ── x-direction: bixel x extent ─────────────────────────────────────────
+    bix_x_lo = x_a - bw_half       # (n_active,)
+    bix_x_hi = x_a + bw_half
 
     # t samples for linear interpolation within each CP gap
     t = np.linspace(0.0, 1.0, n_t)  # (n_t,)
@@ -791,31 +909,35 @@ def _fluence_at_bixels(mlc: dict, x_bev: np.ndarray, z_bev: np.ndarray,
         if dw < 1e-10:
             continue
 
-        # Bank positions for this transition, indexed by leaf pair for each bixel
-        A_start = A[i,   lp_a]   # (n_active,)
-        A_end   = A[i+1, lp_a]
-        B_start = B[i,   lp_a]
-        B_end   = B[i+1, lp_a]
+        # MLC bank positions interpolated over the transition: (n_lp, n_t)
+        A_t = A[i, :, None] + t[None, :] * (A[i + 1] - A[i])[:, None]
+        B_t = B[i, :, None] + t[None, :] * (B[i + 1] - B[i])[:, None]
 
-        # Linear interpolation: shape (n_active, n_t)
-        A_t = A_start[:, None] + t[None, :] * (A_end - A_start)[:, None]
-        B_t = B_start[:, None] + t[None, :] * (B_end - B_start)[:, None]
+        # x open fraction for each (bixel, leaf_pair, t):
+        #   clip(min(x_hi, B_t) - max(x_lo, A_t), 0, bw) / bw
+        # Shape: (n_active, n_lp, n_t)
+        x_open = np.maximum(0.0,
+            np.minimum(bix_x_hi[:, None, None], B_t[None, :, :]) -
+            np.maximum(bix_x_lo[:, None, None], A_t[None, :, :])
+        ) / bixel_width
 
-        # Is bixel x open at each t?  shape (n_active, n_t)
-        open_flag = (A_t < x_a[:, None]) & (x_a[:, None] < B_t)
+        # Average over t → (n_active, n_lp)
+        x_open_mean = x_open.mean(axis=2)
 
-        # Mean open fraction over the transition
-        open_frac = open_flag.mean(axis=1)   # (n_active,)
+        # Dot with z_weights → (n_active,): combined partial overlap in both dims
+        open_frac = (z_weights * x_open_mean).sum(axis=1)
 
         fluence[active] += dw * open_frac
 
-    # Scale by total beam MU
-    fluence *= beam_mu
+    # Scale by total beam MU and absolute calibration factor.
+    fluence *= beam_mu * abs_calib
     return fluence
 
 
 def import_rtplan_fluence(rtplan_file: str, stf: list,
+                          machine: dict = None,
                           n_t: int = 30,
+                          num_fractions: int = 1,
                           verbose: bool = True) -> np.ndarray:
     """Parse Eclipse DICOM RTPlan leaf sequences and return per-bixel weights.
 
@@ -826,12 +948,12 @@ def import_rtplan_fluence(rtplan_file: str, stf: list,
     The MLC leaf boundaries and jaw positions are read from the DICOM file —
     no external MLC model is required.
 
-    The returned weight vector ``w`` has shape ``(totalNumOfBixels,)`` with
-    units of **MU per bixel**.  Pass it directly to ``calc_dose_direct``:
+    The returned weights are calibrated via TG-51 so that
+    ``calc_dose_direct(dij, w)`` returns dose in Gy.
 
     .. code-block:: python
 
-        w = import_rtplan_fluence(plan_file, stf)
+        w = import_rtplan_fluence(plan_file, stf, machine=machine)
         result = calc_dose_direct(dij, w)
 
     Parameters
@@ -841,6 +963,11 @@ def import_rtplan_fluence(rtplan_file: str, stf: list,
     stf : list
         Beam geometry list returned by ``generate_stf()``.
         Used to read bixel BEV positions for each beam.
+    machine : dict, optional
+        Machine data dict from ``load_machine()``.  Used to compute the
+        TG-51 absolute calibration factor (1 MU = 1 cGy at d_max, SSD=100 cm,
+        10×10 cm field) from the machine's depth-dose model.
+        If None, defaults to 0.01 Gy/MU.
     n_t : int
         Number of sub-samples per CP transition for the open-fraction
         integral.  30 is accurate to < 1% for typical sliding-window fields.
@@ -849,8 +976,8 @@ def import_rtplan_fluence(rtplan_file: str, stf: list,
     Returns
     -------
     w : ndarray, shape (totalNumOfBixels,)
-        Per-bixel fluence weights in MU.  Zero for bixels outside the
-        MLC/jaw aperture.
+        Per-bixel weights calibrated in matRad dose units (Gy-equivalent).
+        Zero for bixels outside the MLC/jaw aperture.
 
     Notes
     -----
@@ -870,6 +997,19 @@ def import_rtplan_fluence(rtplan_file: str, stf: list,
         typically < 1% for IMRT fields.
     """
     import pydicom
+
+    # ── Absolute calibration factor ───────────────────────────────────────
+    if machine is not None:
+        abs_calib = _tg51_abs_calib(machine)
+        if verbose:
+            tg51  = machine.get("meta", {}).get("tg51", {})
+            d_max = tg51.get("d_max_mm", float("nan"))
+            src   = "numerical" if tg51 else "analytical"
+            print(f"  TG-51 calib: d_max={d_max:.1f} mm  "
+                  f"abs_calib={abs_calib*100:.4f} cGy/MU  "
+                  f"[{src}]  (SSD=1000mm, 10×10cm field)")
+    else:
+        abs_calib = 0.01   # 1 cGy/MU default
 
     ds = pydicom.dcmread(rtplan_file, stop_before_pixels=True)
 
@@ -954,7 +1094,9 @@ def import_rtplan_fluence(rtplan_file: str, stf: list,
                   f"x=[{x_bev.min():.0f},{x_bev.max():.0f}] mm  "
                   f"z=[{z_bev.min():.0f},{z_bev.max():.0f}] mm")
 
-        beam_w = _fluence_at_bixels(mlc, x_bev, z_bev, mlc["beam_mu"], n_t=n_t)
+        beam_w = _fluence_at_bixels(mlc, x_bev, z_bev, mlc["beam_mu"],
+                                     abs_calib=abs_calib, n_t=n_t,
+                                     bixel_width=stf_beam.get("bixelWidth", 5.0))
         w[bixel_offset: bixel_offset + n_bixels] = beam_w
         bixel_offset += n_bixels
 
@@ -963,4 +1105,158 @@ def import_rtplan_fluence(rtplan_file: str, stf: list,
             print(f"    → {n_open}/{n_bixels} bixels open  "
                   f"total fluence: {beam_w.sum():.1f} MU·bixels")
 
+    # Scale to total plan dose (Eclipse RTDose = num_fractions × single-fraction dose)
+    w *= num_fractions
+
     return w
+
+
+# ---------------------------------------------------------------------------
+# Field-aperture STF generator for eclipse-fluence mode
+# ---------------------------------------------------------------------------
+
+def stf_from_rtplan_aperture(rtplan_file: str, pln: dict,
+                              bixel_width: float = 5.0,
+                              machine: dict = None,
+                              verbose: bool = True) -> list:
+    """Generate a uniform bixel STF directly from DICOM RTPLAN jaw aperture.
+
+    Unlike ``generate_stf()`` which projects TARGET voxels, this function
+    places bixels uniformly over the MLC jaw opening of each beam.  Use this
+    in eclipse-fluence mode so that the bixel grid covers the full Eclipse
+    field — which may be much larger than the PTV projection.
+
+    Parameters
+    ----------
+    rtplan_file : str
+        Path to the DICOM RTPLAN file.
+    pln : dict
+        Plan dict from ``import_rtplan()``; supplies gantry/couch/isocenter.
+    bixel_width : float
+        Bixel (pencil beam) spacing in mm at the isocenter plane.
+    machine : dict, optional
+        Machine dict from ``load_machine()``.  Used to read energy and SAD.
+        Falls back to ``pln`` values when None.
+    verbose : bool
+
+    Returns
+    -------
+    stf : list of beam dicts, compatible with ``calc_dose_influence()``.
+    """
+    import pydicom
+    from ..geometry.geometry import get_rotation_matrix
+
+    ds = pydicom.dcmread(rtplan_file, stop_before_pixels=True)
+
+    beam_seq = list(getattr(ds, "BeamSequence", []))
+    treatment_beams = [b for b in beam_seq
+                       if getattr(b, "TreatmentDeliveryType",
+                                  "TREATMENT").upper() == "TREATMENT"]
+    if not treatment_beams:
+        treatment_beams = beam_seq
+
+    # Machine energy / SAD / name
+    if machine is not None:
+        meta = machine.get("meta", {})
+        data = machine.get("data", {})
+        energy      = float(data.get("energy", 6.0))
+        sad_default = float(meta.get("SAD", pln["propStf"].get("SAD", 1000.0)))
+        machine_name = meta.get("name", meta.get("machine",
+                                                  pln.get("machine", "Generic")))
+    else:
+        energy      = float(np.asarray(
+            pln["propStf"].get("energies_MV", [6.0])).ravel()[0])
+        sad_default = float(pln["propStf"].get("SAD", 1000.0))
+        machine_name = pln.get("machine", "Generic")
+
+    gantry_angles = np.asarray(pln["propStf"]["gantryAngles"]).ravel()
+    couch_angles  = np.asarray(pln["propStf"]["couchAngles"]).ravel()
+    iso_centers   = np.atleast_2d(pln["propStf"]["isoCenter"])
+    if iso_centers.shape[0] == 1:
+        iso_centers = np.tile(iso_centers, (len(gantry_angles), 1))
+
+    # Index DICOM beams by rounded gantry angle for fast lookup
+    dicom_by_gantry: dict = {}
+    for b in treatment_beams:
+        cp0 = b.ControlPointSequence[0]
+        g = round(float(getattr(cp0, "GantryAngle", 0.0)), 1)
+        dicom_by_gantry.setdefault(g, []).append(b)
+
+    stf = []
+    for beam_idx, (gantry, couch, iso) in enumerate(
+            zip(gantry_angles, couch_angles, iso_centers)):
+
+        # Match to nearest DICOM beam (within ±0.5°)
+        if not dicom_by_gantry:
+            warnings.warn("No DICOM beams found in RTPLAN.")
+            break
+        g_key = min(dicom_by_gantry, key=lambda g: abs(g - gantry))
+        if abs(g_key - gantry) > 0.5:
+            warnings.warn(f"stf_from_rtplan_aperture: no DICOM beam within "
+                          f"0.5° of gantry={gantry:.1f}° — skipping beam.")
+            continue
+        dicom_beam = dicom_by_gantry[g_key][0]
+
+        # Jaw extents from MLC data
+        mlc = _parse_beam_mlc(dicom_beam)
+        jaw_x = mlc["jaw_x"]   # [x_min, x_max] mm at isocenter (MLC x)
+        jaw_y = mlc["jaw_y"]   # [y_min, y_max] mm at isocenter (MLC y / leaf-sel)
+
+        sad = float(getattr(dicom_beam, "SourceAxisDistance", sad_default))
+
+        # Uniform bixel grid snapped to bixel_width lattice, covering jaws
+        x_start = bixel_width * np.floor(jaw_x[0] / bixel_width)
+        x_end   = bixel_width * np.ceil (jaw_x[1] / bixel_width)
+        z_start = bixel_width * np.floor(jaw_y[0] / bixel_width)
+        z_end   = bixel_width * np.ceil (jaw_y[1] / bixel_width)
+
+        x_arr = np.arange(x_start, x_end + bixel_width * 0.5, bixel_width)
+        z_arr = np.arange(z_start, z_end + bixel_width * 0.5, bixel_width)
+        XX, ZZ = np.meshgrid(x_arr, z_arr)
+        x_flat = XX.ravel()
+        z_flat = ZZ.ravel()
+
+        if verbose:
+            print(f"  Beam {beam_idx} (gantry={gantry:.1f}°): "
+                  f"jaw x=[{jaw_x[0]:.0f},{jaw_x[1]:.0f}] mm  "
+                  f"jaw y=[{jaw_y[0]:.0f},{jaw_y[1]:.0f}] mm  "
+                  f"→ {len(x_flat)} bixels at {bixel_width:.1f} mm")
+
+        # BEV → world rotation (transpose of active rotation matrix)
+        rot_mat   = get_rotation_matrix(float(gantry), float(couch))
+        rot_mat_T = rot_mat.T   # passive: BEV → world (relative to iso)
+
+        source_bev   = np.array([0.0, -sad, 0.0])
+        source_point = source_bev @ rot_mat_T   # world, relative to iso
+
+        rays = []
+        for x_b, z_b in zip(x_flat, z_flat):
+            rp_bev = np.array([x_b, 0.0,  z_b])
+            tp_bev = np.array([2.0 * x_b, sad, 2.0 * z_b])
+            rays.append({
+                "rayPos_bev":      rp_bev,
+                "targetPoint_bev": tp_bev,
+                "rayPos":          rp_bev @ rot_mat_T,
+                "targetPoint":     tp_bev @ rot_mat_T,
+                "energy":          np.array([energy]),
+                "SSD":             0.0,
+            })
+
+        n_rays = len(rays)
+        stf.append({
+            "gantryAngle":       float(gantry),
+            "couchAngle":        float(couch),
+            "isoCenter":         np.asarray(iso),
+            "SAD":               sad,
+            "bixelWidth":        bixel_width,
+            "radiationMode":     "photons",
+            "machine":           machine_name,
+            "sourcePoint_bev":   source_bev,
+            "sourcePoint":       source_point,
+            "numOfRays":         n_rays,
+            "numOfBixelsPerRay": [1] * n_rays,
+            "totalNumOfBixels":  n_rays,
+            "ray":               rays,
+        })
+
+    return stf
