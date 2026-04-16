@@ -420,7 +420,7 @@ def _print_memory_summary(ct, cst, pln, dose_eclipse, dij, stf, dose_matrad, w):
     # Weight vector
     if w is not None:
         rows.append(("Weight vector w",
-                     f"{len(w):,} bixels  float64",
+                     f"{len(w):,} bixels  {w.dtype}",
                      _array_bytes(w)))
 
     # Dose result

@@ -868,7 +868,7 @@ def _fluence_at_bixels(mlc: dict, x_bev: np.ndarray, z_bev: np.ndarray,
     delta_w = np.diff(cum_w) / cum_w[-1]   # (n_cp-1,), sums to 1.0
 
     N = len(x_bev)
-    fluence = np.zeros(N)
+    fluence = np.zeros(N, dtype=np.float32)
 
     # Active bixels: those whose extent overlaps the jaw and leaf boundary range.
     # Expand jaw check by half bixel width so edge bixels aren't excluded.
@@ -1055,7 +1055,7 @@ def import_rtplan_fluence(rtplan_file: str, stf: list,
 
     # Build per-bixel weight vector ordered by STF bixel sequence
     total_bixels = sum(b["totalNumOfBixels"] for b in stf)
-    w = np.zeros(total_bixels)
+    w = np.zeros(total_bixels, dtype=np.float32)
 
     bixel_offset = 0
     for beam_idx, stf_beam in enumerate(stf):
