@@ -356,7 +356,7 @@ def dose_line_profiles(dose_eclipse: np.ndarray,
 def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
         eclipse_fluence: bool = False, cache_root: str = DEFAULT_CACHE_ROOT,
         force: bool = False, dose_grid_mm: float = 5.0,
-        bixel_width_mm: float = 5.0, roi_half_widths=None):
+        bixel_width_mm: float = 5.0, roi_widths_mm=None):
     plan_dir = os.path.join(SAMPLE_PLANS_ROOT, plan_name)
     if not os.path.isdir(plan_dir):
         print(f"ERROR: plan directory not found: {plan_dir}")
@@ -422,8 +422,9 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
 
     dose_grid_cfg = {"resolution": {"x": r, "y": r, "z": r}}
 
-    if roi_half_widths is not None:
-        dx, dy, dz = [float(v) for v in roi_half_widths]
+    if roi_widths_mm is not None:
+        wx, wy, wz = [float(v) for v in roi_widths_mm]
+        dx, dy, dz = wx / 2.0, wy / 2.0, wz / 2.0
         iso = pln["propStf"]["isoCenter"]
         iso = np.atleast_2d(iso)[0] if np.asarray(iso).ndim > 1 else np.asarray(iso)
         _eps = r * 1e-6
@@ -604,11 +605,12 @@ if __name__ == "__main__":
                         help="Bixel (pencil beam) width in mm at isocenter (default: 5.0). "
                              "Controls the lateral BEV ray spacing during STF generation. "
                              "Each bixel width gets its own dij/result cache entry.")
-    parser.add_argument("--roi", type=float, nargs=3, default=None,
-                        metavar=("DX", "DY", "DZ"),
+    parser.add_argument("--roi-width-around-iso-mm", type=float, nargs=3, default=None,
+                        metavar=("WX", "WY", "WZ"),
                         help="Restrict dose calculation to a rectangular ROI centred on "
-                             "the isocenter.  Supply three half-widths in mm, e.g. "
-                             "--roi 50 100 50 gives ±50 mm in x, ±100 mm in y, ±50 mm in z. "
+                             "the isocenter.  Supply three total widths in mm: "
+                             "--roi-width-around-iso-mm 100 200 100 gives "
+                             "iso ± 50 mm in x, ± 100 mm in y, ± 50 mm in z. "
                              "Omit to use the full CT extent.")
     args = parser.parse_args()
 
@@ -616,4 +618,4 @@ if __name__ == "__main__":
         eclipse_fluence=args.eclipse_fluence,
         cache_root=args.cache_dir, force=args.force,
         dose_grid_mm=args.dose_grid, bixel_width_mm=args.bixel_width,
-        roi_half_widths=args.roi)
+        roi_widths_mm=args.roi_width_around_iso_mm)
