@@ -145,54 +145,56 @@ def _calc_beam_worker(bundle):
         else:
             ray_data.append({'ray_idx': ray_idx, 'vox_ix': None})
 
-    # Phase 2: vectorized batch dose computation (one call covers all rays)
-    active = [r for r in ray_data if r['vox_ix'] is not None]
-    if active and ik is not None:
-        all_rd = np.concatenate([rad_depths[r['vox_ix']] for r in active])
-        all_gd = np.concatenate([geo_dists[r['vox_ix']]  for r in active])
-        all_lx = np.concatenate([r['lat_x']               for r in active])
-        all_lz = np.concatenate([r['lat_z']               for r in active])
+    # Phase 2: per-ray dose computation.
+    # Processing one ray at a time keeps peak memory at O(voxels_per_ray)
+    # rather than O(total_active_voxels), which avoids OOM for large fields
+    # with many bixels (e.g. Eclipse fluence import with 1000+ bixels/beam).
+    for r in ray_data:
+        if r['vox_ix'] is None or ik is None:
+            continue
+        vox_ix = r['vox_ix']
+        rd = rad_depths[vox_ix]
+        gd = geo_dists[vox_ix]
+        lx = r['lat_x']
+        lz = r['lat_z']
 
         # Depth-dose components (Scholz 1994, Eq. 17)
-        dose_component = np.zeros((len(all_rd), n_kernels))
+        dose_component = np.zeros((len(rd), n_kernels))
         for ki in range(n_kernels):
             beta = betas[ki]
             if abs(beta - m) < 1e-10:
-                dose_component[:, ki] = m * all_rd * np.exp(-m * all_rd)
+                dose_component[:, ki] = m * rd * np.exp(-m * rd)
             else:
                 dose_component[:, ki] = (
                     beta / (beta - m) *
-                    (np.exp(-m * all_rd) - np.exp(-beta * all_rd))
+                    (np.exp(-m * rd) - np.exp(-beta * rd))
                 )
 
         # Lateral kernel values (Eq. 19)
-        pts = np.column_stack([all_lz, all_lx])
+        pts = np.column_stack([lz, lx])
         for ki in range(n_kernels):
             if ki < len(ik):
                 kv = ik[ki](pts)
                 kv = np.where(np.isnan(kv), 0.0, kv)
                 dose_component[:, ki] *= kv
 
-        all_dose  = np.sum(dose_component, axis=1)
-        all_dose *= (SAD / all_gd) ** 2
-        all_dose  = np.maximum(all_dose, 0.0)
+        ray_dose  = np.sum(dose_component, axis=1)
+        ray_dose *= (SAD / gd) ** 2
+        ray_dose  = np.maximum(ray_dose, 0.0)
 
-        sizes  = [len(r['vox_ix']) for r in active]
-        chunks = np.split(all_dose, np.cumsum(sizes[:-1]))
-        for r, chunk in zip(active, chunks):
-            if _pf_r is not None:
-                # Scale by primary fluence at the ray's off-axis distance.
-                # Port of MATLAB initRay: Fx = Fpre .* Psi, where Psi is
-                # interp1(primaryFluence(:,1), primaryFluence(:,2), r).
-                # Since the bixel (few mm) is tiny vs the profile scale,
-                # Psi is constant across the bixel → equals pf(r_ray).
-                rp    = np.asarray(rays[r['ray_idx']]['rayPos_bev'])
-                r_ray = float(np.sqrt(rp[0] ** 2 + rp[2] ** 2))
-                pf_scale = float(np.interp(r_ray, _pf_r, _pf_vals,
-                                           left=_pf_vals[0], right=0.0))
-                r['dose'] = chunk * pf_scale
-            else:
-                r['dose'] = chunk
+        if _pf_r is not None:
+            # Scale by primary fluence at the ray's off-axis distance.
+            # Port of MATLAB initRay: Fx = Fpre .* Psi, where Psi is
+            # interp1(primaryFluence(:,1), primaryFluence(:,2), r).
+            # Since the bixel (few mm) is tiny vs the profile scale,
+            # Psi is constant across the bixel → equals pf(r_ray).
+            rp    = np.asarray(rays[r['ray_idx']]['rayPos_bev'])
+            r_ray = float(np.sqrt(rp[0] ** 2 + rp[2] ** 2))
+            pf_scale = float(np.interp(r_ray, _pf_r, _pf_vals,
+                                       left=_pf_vals[0], right=0.0))
+            r['dose'] = ray_dose * pf_scale
+        else:
+            r['dose'] = ray_dose
 
     # Phase 3: build COO return data
     bixelNums, rayNums = [], []
@@ -654,6 +656,12 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
         rotation, ray tracing) sequentially for all beams, then fans out the
         per-ray batch dose math to one worker process per beam.  Workers return
         COO sparse data; the main process assembles the final DIJ matrix.
+
+        Memory-limited mode: set pln["propDoseCalc"]["beamCacheDir"] to a
+        directory path.  Each beam's COO result is saved to a .npz file there
+        immediately after computation (freeing its RAM), and the final matrix
+        is assembled by loading them one at a time.  Already-cached beams are
+        skipped so interrupted runs can resume.
         """
         cfg = MatRad_Config.instance()
 
@@ -675,6 +683,18 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
             offset += b["totalNumOfBixels"]
 
         from ...rayTracing.dispatch import ray_tracing_fast
+
+        # Streaming / disk-cache mode: process one beam at a time, save to npz
+        beam_cache_dir = None
+        if self._pln is not None:
+            beam_cache_dir = self._pln.get("propDoseCalc", {}).get("beamCacheDir", None)
+
+        if beam_cache_dir is not None:
+            return self._calc_dose_streaming(
+                ct, cst, stf, dij,
+                bixel_starts, n_voxels_dose, n_bixels,
+                beam_cache_dir,
+            )
 
         # ------------------------------------------------------------------ #
         # Sequential setup: FFT convolution + geometry + ray tracing per beam #
@@ -798,6 +818,190 @@ class PhotonPencilBeamSVDEngine(DoseEngineBase):
         n_done = sum(r["n_bixels"] for r in beam_results)
         cfg.disp_info(f"\nDone. Computed {n_done} bixels.\n")
 
+        dij["physicalDose"] = [dose_csc]
+        return dij
+
+    def _calc_dose_streaming(
+        self,
+        ct: dict,
+        cst: list,
+        stf: list,
+        dij: dict,
+        bixel_starts: list,
+        n_voxels_dose: int,
+        n_bixels: int,
+        cache_dir: str,
+    ) -> dict:
+        """
+        Memory-limited dose calculation: one beam at a time, results on disk.
+
+        Each beam's COO sparse result is saved to ``cache_dir/beam_NNNN.npz``
+        immediately after computation, then freed from RAM.  Already-present
+        .npz files are skipped, so interrupted runs resume automatically.
+        After all beams the .npz files are loaded one at a time to assemble
+        the final CSC dose matrix.
+
+        Enable by setting  pln["propDoseCalc"]["beamCacheDir"] = "/path/to/dir".
+        """
+        import gc
+        cfg = MatRad_Config.instance()
+        from ...rayTracing.dispatch import ray_tracing_fast
+
+        os.makedirs(cache_dir, exist_ok=True)
+        cfg.disp_info(f"Streaming mode: beam cache → {cache_dir}\n")
+
+        n_beams = len(stf)
+
+        # ------------------------------------------------------------------ #
+        # Phase 1: compute each beam, save COO to npz, free immediately        #
+        # ------------------------------------------------------------------ #
+        for beam_idx, beam_stf in enumerate(stf):
+            npz_path = os.path.join(cache_dir, f"beam_{beam_idx:04d}.npz")
+            if os.path.exists(npz_path):
+                cfg.disp_info(
+                    f"\nBeam {beam_idx+1}/{n_beams}: "
+                    f"gantry={beam_stf['gantryAngle']}°  [cached, skipping]\n"
+                )
+                continue
+
+            cfg.disp_info(
+                f"\nBeam {beam_idx+1}/{n_beams}: gantry={beam_stf['gantryAngle']}°\n"
+            )
+
+            beam = self._init_beam(ct, cst, stf, beam_idx, dij)
+
+            rot_mat    = get_rotation_matrix(beam["gantryAngle"], beam["couchAngle"])
+            iso_center = np.asarray(beam["isoCenter"])
+            source_bev = np.asarray(beam["sourcePoint_bev"])
+
+            rot_coords          = (self._vox_world_coords_dose_grid - iso_center) @ rot_mat
+            rot_coords_relative = rot_coords - source_bev
+            geo_dists           = np.sqrt(np.sum(rot_coords_relative ** 2, axis=1))
+
+            cfg.disp_info("  Ray tracing for radiological depths...\n")
+            rad_depths = ray_tracing_fast(
+                {
+                    "isoCenter":       iso_center,
+                    "sourcePoint_bev": source_bev,
+                    "sourcePoint":     beam.get("sourcePoint", source_bev),
+                    "ray":             beam["ray"],
+                    "SAD":             beam["SAD"],
+                },
+                ct, self._V_dose_grid, rot_coords_relative,
+                self._effective_lateral_cutoff,
+            )[0]
+
+            SAD         = beam["SAD"]
+            proj_factor = SAD / np.where(
+                np.abs(SAD + rot_coords[:, 1]) < 1e-6,
+                1e-6, SAD + rot_coords[:, 1],
+            )
+            iso_lat_x = rot_coords[:, 0] * proj_factor
+            iso_lat_z = rot_coords[:, 2] * proj_factor
+
+            bundle = {
+                "beam_idx":    beam_idx,
+                "bixel_start": bixel_starts[beam_idx],
+                "rays":        beam["ray"],
+                "ik":          self._interp_kernel_cache,
+                "rad_depths":  rad_depths,
+                "geo_dists":   geo_dists,
+                "iso_lat_x":   iso_lat_x,
+                "iso_lat_z":   iso_lat_z,
+                "V_dose_grid": self._V_dose_grid,
+                "cutoff_sq":   self._effective_lateral_cutoff ** 2,
+                "SAD":         float(SAD),
+                "m":           float(self.machine["data"].get("m", 0.03)),
+                "betas":       np.asarray(
+                    self.machine["data"].get("betas", [0.04, 0.15, 0.60])
+                ).ravel(),
+                "ignore_invalid":       self.ignore_invalid_values,
+                "enable_dij_sampling":  self.enable_dij_sampling,
+                "is_field_based":       self.is_field_based_dose_calc,
+                "field_width":          self._field_width,
+                "dij_sampling":         getattr(self, "dij_sampling", {}),
+                "use_custom_pf":        self.use_custom_primary_photon_fluence,
+                "pf_data":              np.asarray(
+                    self.machine["data"].get("primaryFluence", np.zeros((0, 2)))
+                ),
+            }
+
+            cfg.disp_info(f"  Computing dose ({beam['totalNumOfBixels']} bixels)...\n")
+            result = _calc_beam_worker(bundle)
+
+            np.savez_compressed(
+                npz_path,
+                coo_rows   = result["coo_rows"].astype(np.int32),
+                coo_cols   = result["coo_cols"].astype(np.int32),
+                coo_data   = result["coo_data"].astype(np.float32),
+                bixelNums  = np.array(result["bixelNums"],  dtype=np.int32),
+                rayNums    = np.array(result["rayNums"],    dtype=np.int32),
+                beam_idx   = np.array([result["beam_idx"]],   dtype=np.int32),
+                bixel_start= np.array([result["bixel_start"]], dtype=np.int64),
+                n_bixels   = np.array([result["n_bixels"]],   dtype=np.int32),
+            )
+            size_mb = os.path.getsize(npz_path) / 1e6
+            cfg.disp_info(
+                f"  Saved {npz_path}  ({size_mb:.1f} MB, "
+                f"{result['n_bixels']} bixels, {len(result['coo_rows'])} nnz)\n"
+            )
+
+            # Explicitly free large arrays before next beam
+            del bundle, result, beam
+            del rot_coords, rot_coords_relative, geo_dists, rad_depths
+            del iso_lat_x, iso_lat_z
+            gc.collect()
+
+        # ------------------------------------------------------------------ #
+        # Phase 2: assemble CSC matrix from saved npz files.                 #
+        # Two-pass approach: first count total nnz so we can allocate output #
+        # arrays exactly once, then fill them beam-by-beam without holding   #
+        # all beams' arrays in RAM simultaneously.                            #
+        # ------------------------------------------------------------------ #
+        cfg.disp_info("\nAssembling dose matrix from beam cache...\n")
+
+        # Pass 1: count total nnz and collect bixel metadata
+        total_nnz = 0
+        n_done = 0
+        for beam_idx in range(n_beams):
+            npz_path = os.path.join(cache_dir, f"beam_{beam_idx:04d}.npz")
+            data = np.load(npz_path, mmap_mode='r')
+            total_nnz += len(data["coo_data"])
+            n_done    += int(data["n_bixels"][0])
+            bixel_start = int(data["bixel_start"][0])
+            for local_col, (bn, rn) in enumerate(
+                zip(data["bixelNums"].tolist(), data["rayNums"].tolist())
+            ):
+                col = bixel_start + local_col
+                dij["bixelNum"][col] = int(bn)
+                dij["rayNum"][col]   = int(rn)
+                dij["beamNum"][col]  = beam_idx + 1
+
+        # Pass 2: fill pre-allocated output arrays one beam at a time
+        all_rows_arr = np.empty(total_nnz, dtype=np.int32)
+        all_cols_arr = np.empty(total_nnz, dtype=np.int32)
+        all_data_arr = np.empty(total_nnz, dtype=np.float32)
+        offset = 0
+        for beam_idx in range(n_beams):
+            npz_path = os.path.join(cache_dir, f"beam_{beam_idx:04d}.npz")
+            data = np.load(npz_path)
+            n = len(data["coo_data"])
+            all_rows_arr[offset:offset + n] = data["coo_rows"]
+            all_cols_arr[offset:offset + n] = data["coo_cols"]
+            all_data_arr[offset:offset + n] = data["coo_data"]
+            offset += n
+            del data
+
+        if total_nnz > 0:
+            dose_csc = sp.coo_matrix(
+                (all_data_arr, (all_rows_arr, all_cols_arr)),
+                shape=(n_voxels_dose, n_bixels),
+            ).tocsc()
+            del all_rows_arr, all_cols_arr, all_data_arr
+        else:
+            dose_csc = sp.csc_matrix((n_voxels_dose, n_bixels))
+
+        cfg.disp_info(f"\nDone. Computed {n_done} bixels.\n")
         dij["physicalDose"] = [dose_csc]
         return dij
 

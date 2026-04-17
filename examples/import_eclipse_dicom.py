@@ -558,10 +558,17 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
         nz = int(np.ceil((ct["z"][-1] - ct["z"][0]) / r)) + 1
         print(f"  ROI: full CT  → ~{ny}×{nx}×{nz} voxels")
 
+    # Derive per-beam npz cache dir from the plan cache so that each beam's
+    # dose result is written to disk immediately and freed from RAM.  This
+    # prevents OOM on large CTs / many bixels (beam results no longer
+    # accumulate in memory).  Already-saved beams are skipped on re-runs.
+    beam_cache_dir = os.path.join(_cache_dir(plan_name, cache_root), "beam_doses")
+
     pln["propDoseCalc"].update({
         "doseGrid":              dose_grid_cfg,
         "ignoreOutsideDensities": False,
         "numWorkers":            1,
+        "beamCacheDir":          beam_cache_dir,
     })
     pln["propStf"]["bixelWidth"] = bw
 
