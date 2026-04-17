@@ -45,6 +45,9 @@ python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence \
 # Restrict dose calc to a 100×200×100 mm box around isocenter at 2.5 mm resolution
 python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence \
     --roi-width-around-iso-mm 100 200 100 --dose-grid 2.5
+
+# Per-beam parallel workflow: compute beam 0 only, save to cache
+python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence --beam-num 0
 ```
 
 ---
@@ -57,6 +60,7 @@ python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence \
 | `--ct-dir DIR` | — | Separate CT directory (relative to `eclipse_tps/`). Needed for `ap_IMRT` and `ap_VMAT` which share the `ap_sMLC` CT. |
 | `--no-dose-calc` | off | Skip STF generation, dij computation, and optimisation. Only imports and prints structure/beam summary. |
 | `--eclipse-fluence` | off | Use Eclipse MLC leaf sequences to reproduce Eclipse dose rather than re-optimising fluence from scratch. |
+| `--beam-num N` | — | Compute and cache the dose contribution of a single beam only (0-based index). Skips Eclipse dose comparison. See [Per-Beam Parallel Workflow](#per-beam-parallel-workflow) below. |
 | `--bixel-width MM` | `5.0` | Bixel side length in mm (square bixels). Independent of dose grid resolution. |
 | `--dose-grid MM` | `5.0` | Isotropic dose calculation grid resolution in mm. |
 | `--roi-width-around-iso-mm WX WY WZ` | — | Restrict dose calculation to a rectangular box centred on the isocenter. Supply three **total** widths in mm. `--roi-width-around-iso-mm 100 200 100` gives iso ± 50 mm in x, ± 100 mm in y, ± 50 mm in z. Omit to use the full CT extent. |
@@ -76,6 +80,53 @@ python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence \
 
 Cache files include both dose grid and bixel width in the tag (`dg5.0mm_bw5.0mm`) so changing
 either parameter automatically triggers a recompute.
+
+---
+
+## Per-Beam Parallel Workflow
+
+`--beam-num N` lets you compute and cache the dose contribution of one beam at a
+time.  This is useful for parallelising jobs on a cluster: submit one job per
+beam, then run a final aggregation step.
+
+### Step 1 — compute each beam independently (in parallel)
+
+```bash
+# e.g. submit as 7 separate SLURM / PBS array jobs
+python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence --beam-num 0
+python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence --beam-num 1
+python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence --beam-num 2
+...
+python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence --beam-num 6
+```
+
+Each job:
+- Loads the DICOM import and STF from cache (or computes them if not present).
+- When the full dij is **not** cached, computes only beam N's influence matrix
+  (much faster than the full dij) without saving it to the shared dij cache.
+- Saves the result to `cache/{plan}/beam_result_{mode}_{N}_{tag}.npz`.
+- Skips Eclipse dose comparison.
+
+### Step 2 — aggregate and compare
+
+```bash
+python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence
+```
+
+The all-beams run checks for per-beam cache files before computing anything.
+Beams already in cache are loaded; only missing beams are recomputed.  All
+beam doses are summed and compared against the Eclipse RTDose as usual.
+
+### Notes
+
+- Works for both `--eclipse-fluence` and default re-optimised mode.  In
+  re-optimised mode each beam's fluence is optimised in isolation, which is
+  physically different from a joint multi-beam optimisation.
+- Per-beam cache files are tagged identically to full-plan results
+  (`dg5.0mm_bw5.0mm`), so changing `--dose-grid` or `--bixel-width` triggers
+  a recompute for all beams.
+- You can mix pre-computed and on-the-fly beams freely: run Step 2 at any time
+  and it will fill in whichever beams are still missing.
 
 ---
 

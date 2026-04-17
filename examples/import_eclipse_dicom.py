@@ -8,6 +8,23 @@ Usage
     python examples/import_eclipse_dicom.py --plan ap_IMRT --ct-dir ../ap_sMLC
     python examples/import_eclipse_dicom.py --plan 7beam_IMRT --no-dose-calc
 
+Per-beam parallel workflow (--beam-num)
+---------------------------------------
+Compute each beam's dose independently (e.g. on a cluster), then sum:
+
+    # Step 1 — run one job per beam (can run in parallel):
+    python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence --beam-num 0
+    python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence --beam-num 1
+    ...
+    python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence --beam-num 6
+
+    # Step 2 — sum all cached beam doses and compare with Eclipse RTDose:
+    python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence
+
+When running without --beam-num, any beam whose per-beam result is already
+cached (from a prior --beam-num run) is loaded directly; only missing beams
+are recomputed.  This lets you mix pre-computed and on-the-fly beams freely.
+
 Plans available (in ../_sample_plans/eclipse_tps/):
     Plan          CT     Struct  Dose
     7beam_IMRT    yes    yes     yes   — prostate IMRT, 7 beams 6 MV
@@ -183,6 +200,37 @@ def load_result(plan_name: str, mode: str, cache_root: str,
         return None, None
     data = np.load(path)
     print(f"  Loaded result ← {os.path.basename(path)}")
+    return data["physicalDose"], data["w"]
+
+
+def _beam_bixel_slice(stf: list, beam_idx: int):
+    """Return (start, stop) column indices for beam_idx in the full dij matrix."""
+    start = sum(stf[i]["totalNumOfBixels"] for i in range(beam_idx))
+    n = stf[beam_idx]["totalNumOfBixels"]
+    return start, start + n
+
+
+def save_beam_result(plan_name: str, mode: str, beam_idx: int,
+                     dose: np.ndarray, w: np.ndarray, cache_root: str,
+                     dose_grid_mm: float = 5.0, bixel_width_mm: float = 5.0):
+    """Save per-beam dose result (physicalDose cube + weight vector) to cache."""
+    d    = _cache_dir(plan_name, cache_root)
+    tag  = _grid_tag(dose_grid_mm, bixel_width_mm)
+    path = os.path.join(d, f"beam_result_{mode}_{beam_idx}_{tag}.npz")
+    np.savez_compressed(path, physicalDose=dose, w=w)
+    print(f"  Saved beam {beam_idx} result → {os.path.basename(path)}")
+
+
+def load_beam_result(plan_name: str, mode: str, beam_idx: int, cache_root: str,
+                     dose_grid_mm: float = 5.0, bixel_width_mm: float = 5.0):
+    """Load per-beam dose result from cache.  Returns (dose, w) or (None, None)."""
+    tag  = _grid_tag(dose_grid_mm, bixel_width_mm)
+    path = os.path.join(cache_root, plan_name,
+                        f"beam_result_{mode}_{beam_idx}_{tag}.npz")
+    if not os.path.exists(path):
+        return None, None
+    data = np.load(path)
+    print(f"  Loaded beam {beam_idx} result ← {os.path.basename(path)}")
     return data["physicalDose"], data["w"]
 
 
@@ -466,7 +514,8 @@ def _print_timing_summary(timings: dict):
 def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
         eclipse_fluence: bool = False, cache_root: str = DEFAULT_CACHE_ROOT,
         force: bool = False, dose_grid_mm: float = 5.0,
-        bixel_width_mm: float = 5.0, roi_widths_mm=None):
+        bixel_width_mm: float = 5.0, roi_widths_mm=None,
+        beam_num: int = None):
     plan_dir = os.path.join(SAMPLE_PLANS_ROOT, plan_name)
     if not os.path.isdir(plan_dir):
         print(f"ERROR: plan directory not found: {plan_dir}")
@@ -601,6 +650,8 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
     field_stf = eclipse_fluence
     dij, stf = (None, None) if force else load_dij(
         plan_name, cache_root, dose_grid_mm, bixel_width_mm, field_stf)
+    # True when dij covers only beam_num (not the full set of beams)
+    dij_is_single_beam = False
     if dij is None:
         t0 = time.perf_counter()
         if eclipse_fluence:
@@ -614,47 +665,143 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
         print(f"  {len(stf)} beams, {total_bixels} bixels total")
         timings["STF generation"] = time.perf_counter() - t0
 
-        print("\nCalculating dose influence matrix ...")
-        t0 = time.perf_counter()
-        dij = matRad.calc_dose_influence(ct, cst, stf, pln)
-        timings["dij calc"] = time.perf_counter() - t0
-        save_dij(plan_name, dij, stf, cache_root, dose_grid_mm, bixel_width_mm, field_stf)
+        if beam_num is not None:
+            # Compute dij only for the requested beam — full dij not cached so
+            # subsequent per-beam jobs each compute their own slice quickly.
+            print(f"\nCalculating dose influence matrix for beam {beam_num} only ...")
+            t0 = time.perf_counter()
+            dij = matRad.calc_dose_influence(ct, cst, [stf[beam_num]], pln)
+            timings["dij calc"] = time.perf_counter() - t0
+            dij_is_single_beam = True
+        else:
+            print("\nCalculating dose influence matrix ...")
+            t0 = time.perf_counter()
+            dij = matRad.calc_dose_influence(ct, cst, stf, pln)
+            timings["dij calc"] = time.perf_counter() - t0
+            save_dij(plan_name, dij, stf, cache_root, dose_grid_mm, bixel_width_mm, field_stf)
     else:
         total_bixels = sum(b["totalNumOfBixels"] for b in stf)
         print(f"  {len(stf)} beams, {total_bixels} bixels total (from cache)")
+
+    if beam_num is not None and beam_num >= len(stf):
+        print(f"ERROR: --beam-num {beam_num} is out of range "
+              f"(plan has {len(stf)} beams, indices 0–{len(stf)-1})")
+        sys.exit(1)
 
     # Memory summary after all major objects are loaded
     _print_memory_summary(ct, cst, pln, dose_eclipse, dij, stf, None, None)
 
     mode = "eclipse_fluence" if eclipse_fluence else "reoptimised"
-    dose_matrad, w_cached = (None, None) if force else load_result(plan_name, mode, cache_root, dose_grid_mm, bixel_width_mm)
+
+    # ── 5. Single-beam mode ──────────────────────────────────────────────
+    if beam_num is not None:
+        beam_dose, beam_w = (None, None) if force else load_beam_result(
+            plan_name, mode, beam_num, cache_root, dose_grid_mm, bixel_width_mm)
+
+        if beam_dose is None:
+            # Build a single-beam dij view
+            if dij_is_single_beam:
+                dij_beam = dij          # already covers only beam_num
+            else:
+                b_start, b_end = _beam_bixel_slice(stf, beam_num)
+                mat = dij["physicalDose"][0]
+                dij_beam = dict(dij)
+                dij_beam["physicalDose"] = [mat[:, b_start:b_end]]
+
+            if eclipse_fluence:
+                print(f"\nImporting Eclipse MLC fluence for beam {beam_num} ...")
+                t0 = time.perf_counter()
+                beam_w = matRad.dicom.import_rtplan_fluence(
+                    plan_file, [stf[beam_num]], machine=machine,
+                    num_fractions=pln.get("numOfFractions", 1))
+                timings["MLC fluence import"] = time.perf_counter() - t0
+                print(f"  Bixels: {len(beam_w)}  non-zero: {np.sum(beam_w > 0)}")
+                print(f"\nComputing dose for beam {beam_num} ...")
+                t0 = time.perf_counter()
+                result_beam = matRad.calc_dose_direct(dij_beam, beam_w)
+                timings["dose calc"] = time.perf_counter() - t0
+            else:
+                print(f"\nOptimising fluence for beam {beam_num} in isolation ...")
+                t0 = time.perf_counter()
+                result_beam = matRad.fluence_optimization(dij_beam, cst, pln)
+                timings["fluence optimisation"] = time.perf_counter() - t0
+                beam_w = result_beam["w"]
+
+            beam_dose = result_beam["physicalDose"]
+            save_beam_result(plan_name, mode, beam_num, beam_dose, beam_w,
+                             cache_root, dose_grid_mm, bixel_width_mm)
+
+        label = "matRad (Eclipse fluence)" if eclipse_fluence else "matRad (re-optimised)"
+        print(f"\n  Beam {beam_num} {label} max dose: {beam_dose.max():.3f} Gy")
+        timings["total"] = time.perf_counter() - t_total
+        _print_memory_summary(ct, cst, pln, dose_eclipse, dij, stf, beam_dose, beam_w)
+        _print_timing_summary(timings)
+        print(f"\nDone: {plan_name}  beam {beam_num}")
+        return
+
+    # ── 6. All-beams dose ────────────────────────────────────────────────
+    dose_matrad, w_cached = (None, None) if force else load_result(
+        plan_name, mode, cache_root, dose_grid_mm, bixel_width_mm)
 
     if dose_matrad is None:
         if eclipse_fluence:
-            # ── 5a. Reproduce Eclipse dose from MLC leaf sequences ────────
-            print("\nImporting Eclipse MLC fluence ...")
-            t0 = time.perf_counter()
-            w = matRad.dicom.import_rtplan_fluence(
-                plan_file, stf, machine=machine,
-                num_fractions=pln.get("numOfFractions", 1))
-            timings["MLC fluence import"] = time.perf_counter() - t0
-            beam_mus = pln["propStf"]["beamMU"]
-            print(f"  Weight vector: {len(w)} bixels  non-zero: {np.sum(w>0)}")
-            print(f"  Total MU: {beam_mus.sum():.1f}  "
-                  f"Total w: {w.sum():.3f}")
-            print("\nComputing dose from Eclipse fluence ...")
-            t0 = time.perf_counter()
-            result_matrad = matRad.calc_dose_direct(dij, w)
-            timings["dose calc (direct)"] = time.perf_counter() - t0
+            # ── 6a. Reproduce Eclipse dose from MLC leaf sequences ────────
+            # Check per-beam cache first; only compute beams that are missing.
+            n_beams = len(stf)
+            beam_doses = []     # list of (beam_idx, dose_array, w_array)
+            missing_beams = []
+            for i in range(n_beams):
+                bd, bw = load_beam_result(
+                    plan_name, mode, i, cache_root, dose_grid_mm, bixel_width_mm)
+                if bd is not None:
+                    beam_doses.append((i, bd, bw))
+                else:
+                    missing_beams.append(i)
+
+            if missing_beams:
+                # Read RTPLAN fluence for all beams at once (single DICOM read)
+                print("\nImporting Eclipse MLC fluence ...")
+                t0 = time.perf_counter()
+                w_all = matRad.dicom.import_rtplan_fluence(
+                    plan_file, stf, machine=machine,
+                    num_fractions=pln.get("numOfFractions", 1))
+                timings["MLC fluence import"] = time.perf_counter() - t0
+                beam_mus = pln["propStf"]["beamMU"]
+                print(f"  Weight vector: {len(w_all)} bixels  "
+                      f"non-zero: {np.sum(w_all > 0)}")
+                print(f"  Total MU: {beam_mus.sum():.1f}  "
+                      f"Total w: {w_all.sum():.3f}")
+
+                mat_full = dij["physicalDose"][0]
+                for i in missing_beams:
+                    b_start, b_end = _beam_bixel_slice(stf, i)
+                    dij_beam = dict(dij)
+                    dij_beam["physicalDose"] = [mat_full[:, b_start:b_end]]
+                    w_beam = w_all[b_start:b_end]
+
+                    print(f"\nComputing dose for beam {i} ...")
+                    t0 = time.perf_counter()
+                    result_beam = matRad.calc_dose_direct(dij_beam, w_beam)
+                    timings[f"dose calc beam {i}"] = time.perf_counter() - t0
+
+                    bd = result_beam["physicalDose"]
+                    save_beam_result(plan_name, mode, i, bd, w_beam,
+                                     cache_root, dose_grid_mm, bixel_width_mm)
+                    beam_doses.append((i, bd, w_beam))
+
+            beam_doses.sort(key=lambda x: x[0])
+            dose_matrad = sum(bd for _, bd, _ in beam_doses)
+            w = np.concatenate([bw for _, _, bw in beam_doses])
+
         else:
-            # ── 5b. Independent matRad fluence optimisation ───────────────
+            # ── 6b. Independent matRad fluence optimisation ───────────────
             print("\nOptimising fluence ...")
             t0 = time.perf_counter()
             result_matrad = matRad.fluence_optimization(dij, cst, pln)
             timings["fluence optimisation"] = time.perf_counter() - t0
             w = result_matrad["w"]
+            dose_matrad = result_matrad["physicalDose"]
 
-        dose_matrad = result_matrad["physicalDose"]
         save_result(plan_name, mode, dose_matrad, w, cache_root, dose_grid_mm, bixel_width_mm)
     else:
         w = w_cached
@@ -662,7 +809,7 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
     label = "matRad (Eclipse fluence)" if eclipse_fluence else "matRad (re-optimised)"
     print(f"  {label} max dose: {dose_matrad.max():.3f} Gy")
 
-    # ── 6. Comparison ────────────────────────────────────────────────────
+    # ── 7. Comparison ────────────────────────────────────────────────────
     if dose_eclipse is not None:
         # Interpolate Eclipse dose from its native DICOM grid directly onto
         # the matRad dose calc grid — one hop, no CT grid intermediate.
@@ -753,10 +900,22 @@ if __name__ == "__main__":
                              "--roi-width-around-iso-mm 100 200 100 gives "
                              "iso ± 50 mm in x, ± 100 mm in y, ± 50 mm in z. "
                              "Omit to use the full CT extent.")
+    parser.add_argument("--beam-num", type=int, default=None, metavar="N",
+                        help="Compute and cache the dose contribution of a single beam "
+                             "(0-based index, e.g. 0 for the first beam).  "
+                             "Skips Eclipse dose comparison.  "
+                             "Intended for parallel cluster jobs: run one job per beam, "
+                             "then run without --beam-num to sum all beam results.  "
+                             "When the full dij is not cached, only beam N's influence "
+                             "matrix is computed (faster).  "
+                             "For --eclipse-fluence mode the Eclipse MLC leaf sequences "
+                             "for beam N are used; for re-optimised mode the fluence is "
+                             "optimised for beam N in isolation.")
     args = parser.parse_args()
 
     run(args.plan, ct_dir=args.ct_dir, calc_dose=not args.no_dose_calc,
         eclipse_fluence=args.eclipse_fluence,
         cache_root=args.cache_dir, force=args.force,
         dose_grid_mm=args.dose_grid, bixel_width_mm=args.bixel_width,
-        roi_widths_mm=args.roi_width_around_iso_mm)
+        roi_widths_mm=args.roi_width_around_iso_mm,
+        beam_num=args.beam_num)
