@@ -721,17 +721,20 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
                 result_beam = matRad.calc_dose_direct(dij_beam, beam_w)
                 timings["dose calc"] = time.perf_counter() - t0
             else:
-                print(f"\nOptimising fluence for beam {beam_num} in isolation ...")
+                # Forward calculation with uniform fluence (no optimization)
+                n_bixels = dij_beam["physicalDose"][0].shape[1]
+                beam_w = np.ones(n_bixels, dtype=np.float32)
+                print(f"\nComputing dose for beam {beam_num} (uniform fluence, {n_bixels} bixels) ...")
                 t0 = time.perf_counter()
-                result_beam = matRad.fluence_optimization(dij_beam, cst, pln)
-                timings["fluence optimisation"] = time.perf_counter() - t0
-                beam_w = result_beam["w"]
+                result_beam = matRad.calc_dose_direct(dij_beam, beam_w)
+                timings["dose calc"] = time.perf_counter() - t0
 
             beam_dose = result_beam["physicalDose"]
             save_beam_result(plan_name, mode, beam_num, beam_dose, beam_w,
                              cache_root, dose_grid_mm, bixel_width_mm)
 
-        label = "matRad (Eclipse fluence)" if eclipse_fluence else "matRad (re-optimised)"
+        label = ("matRad (Eclipse fluence)" if eclipse_fluence
+                 else "matRad (uniform fluence)")
         print(f"\n  Beam {beam_num} {label} max dose: {beam_dose.max():.3f} Gy")
         timings["total"] = time.perf_counter() - t_total
         _print_memory_summary(ct, cst, pln, dose_eclipse, dij, stf, beam_dose, beam_w)
@@ -909,8 +912,8 @@ if __name__ == "__main__":
                              "When the full dij is not cached, only beam N's influence "
                              "matrix is computed (faster).  "
                              "For --eclipse-fluence mode the Eclipse MLC leaf sequences "
-                             "for beam N are used; for re-optimised mode the fluence is "
-                             "optimised for beam N in isolation.")
+                             "for beam N are used; otherwise a uniform fluence (all "
+                             "bixel weights = 1) is used for a direct forward calculation.")
     args = parser.parse_args()
 
     run(args.plan, ct_dir=args.ct_dir, calc_dose=not args.no_dose_calc,
