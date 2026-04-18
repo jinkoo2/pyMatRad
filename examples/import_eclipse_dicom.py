@@ -515,7 +515,7 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
         eclipse_fluence: bool = False, cache_root: str = DEFAULT_CACHE_ROOT,
         force: bool = False, dose_grid_mm: float = 5.0,
         bixel_width_mm: float = 5.0, roi_widths_mm=None,
-        beam_num: int = None):
+        beam_num: int = None, machine_name: str = None):
     plan_dir = os.path.join(SAMPLE_PLANS_ROOT, plan_name)
     if not os.path.isdir(plan_dir):
         print(f"ERROR: plan directory not found: {plan_dir}")
@@ -554,6 +554,12 @@ def run(plan_name: str, ct_dir: str = None, calc_dose: bool = True,
         save_import(plan_name, ct, cst, pln, dose_eclipse,
                     dose_eclipse_grid, cache_root)
     timings["DICOM import"] = time.perf_counter() - t0
+
+    # Override machine name if the user specified one explicitly
+    if machine_name is not None and pln is not None:
+        old = pln.get("machine", "Generic")
+        pln["machine"] = machine_name
+        print(f"  Machine override: {old} → {machine_name}")
 
     print(f"\nStructures ({len(cst)}):")
     for row in cst:
@@ -903,6 +909,12 @@ if __name__ == "__main__":
                              "--roi-width-around-iso-mm 100 200 100 gives "
                              "iso ± 50 mm in x, ± 100 mm in y, ± 50 mm in z. "
                              "Omit to use the full CT extent.")
+    parser.add_argument("--machine", default=None, metavar="NAME",
+                        help="Override the machine name used for dose calculation "
+                             "(overrides the value inferred from beam energy in the RTPLAN). "
+                             "The file '{radiationMode}_{NAME}.mat' or '.npy' must exist in "
+                             "matRad/basedata/ or pyMatRad/userdata/machines/. "
+                             "Example: --machine TrueBeam_6X")
     parser.add_argument("--beam-num", type=int, default=None, metavar="N",
                         help="Compute and cache the dose contribution of a single beam "
                              "(0-based index, e.g. 0 for the first beam).  "
@@ -921,4 +933,4 @@ if __name__ == "__main__":
         cache_root=args.cache_dir, force=args.force,
         dose_grid_mm=args.dose_grid, bixel_width_mm=args.bixel_width,
         roi_widths_mm=args.roi_width_around_iso_mm,
-        beam_num=args.beam_num)
+        beam_num=args.beam_num, machine_name=args.machine)
