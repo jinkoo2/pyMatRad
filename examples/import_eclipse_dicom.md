@@ -48,6 +48,10 @@ python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence \
 
 # Per-beam parallel workflow: compute beam 0 only, save to cache
 python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence --beam-num 0
+
+# Use a specific machine file instead of the energy-inferred default
+python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence \
+    --machine TrueBeam_6X
 ```
 
 ---
@@ -61,6 +65,7 @@ python examples/import_eclipse_dicom.py --plan 7beam_IMRT --eclipse-fluence --be
 | `--no-dose-calc` | off | Skip STF generation, dij computation, and optimisation. Only imports and prints structure/beam summary. |
 | `--eclipse-fluence` | off | Use Eclipse MLC leaf sequences to reproduce Eclipse dose rather than re-optimising fluence from scratch. |
 | `--beam-num N` | — | Compute and cache the dose contribution of a single beam only (0-based index). Skips Eclipse dose comparison. See [Per-Beam Parallel Workflow](#per-beam-parallel-workflow) below. |
+| `--machine NAME` | — | Override the machine used for dose calculation. Overrides the value inferred from beam energy (e.g. 6 MV → `TrueBeam_6X`). The file `{radiationMode}_{NAME}.mat/.npy` must exist in `matRad/basedata/` or `pyMatRad/userdata/machines/`. See [Machine Selection](#machine-selection) below. |
 | `--bixel-width MM` | `5.0` | Bixel side length in mm (square bixels). Independent of dose grid resolution. |
 | `--dose-grid MM` | `5.0` | Isotropic dose calculation grid resolution in mm. |
 | `--roi-width-around-iso-mm WX WY WZ` | — | Restrict dose calculation to a rectangular box centred on the isocenter. Supply three **total** widths in mm. `--roi-width-around-iso-mm 100 200 100` gives iso ± 50 mm in x, ± 100 mm in y, ± 50 mm in z. Omit to use the full CT extent. |
@@ -119,14 +124,76 @@ beam doses are summed and compared against the Eclipse RTDose as usual.
 
 ### Notes
 
-- Works for both `--eclipse-fluence` and default re-optimised mode.  In
-  re-optimised mode each beam's fluence is optimised in isolation, which is
-  physically different from a joint multi-beam optimisation.
+- Works for both `--eclipse-fluence` and default re-optimised mode:
+  - **`--eclipse-fluence`**: MLC leaf sequences for beam N are read from the
+    RTPLAN and used as bixel weights (physically meaningful, matches Eclipse).
+  - **re-optimised (no `--eclipse-fluence`)**: a uniform fluence
+    (`w = ones(n_bixels)`) is used — a forward calculation showing the
+    geometric dose contribution of that beam with no fluence modulation.
+    This is fast (single matrix–vector multiply) and suitable for beam
+    geometry inspection; it is not a clinical fluence optimisation.
 - Per-beam cache files are tagged identically to full-plan results
   (`dg5.0mm_bw5.0mm`), so changing `--dose-grid` or `--bixel-width` triggers
   a recompute for all beams.
 - You can mix pre-computed and on-the-fly beams freely: run Step 2 at any time
   and it will fill in whichever beams are still missing.
+
+---
+
+## Machine Selection
+
+The machine file encodes the photon kernel data (depth-dose and scatter kernels,
+calibration factor, SAD) used by the SVD dose engine and by `import_rtplan_fluence`.
+
+### Automatic selection
+
+By default, `import_rtplan` maps beam energy → machine name:
+
+| Beam energy | Default machine |
+|-------------|----------------|
+| 6 MV | `TrueBeam_6X` |
+| 10 MV (FFF) | `TrueBeam_10XFFF` |
+| 15 MV | `TrueBeam_15X` |
+| other | `Generic` |
+
+The resolved name is printed at import time:
+
+```
+  Energy: 6.0 MV  → machine: TrueBeam_6X
+```
+
+### Override with `--machine`
+
+```bash
+python examples/import_eclipse_dicom.py --plan 7beam_IMRT \
+    --eclipse-fluence --machine TrueBeam_6X
+```
+
+The override is applied immediately after DICOM import and printed:
+
+```
+  Machine override: Generic → TrueBeam_6X
+```
+
+Because `pln["machine"]` is the single source of truth, the override propagates
+automatically to every downstream caller:
+
+| Caller | Where |
+|--------|-------|
+| STF generator | `stf_generator.py` |
+| SVD photon dose engine | `photon_svd_engine.py` |
+| Eclipse fluence import | `importer.py` → `import_rtplan_fluence` |
+
+### Machine file locations
+
+`load_machine` searches in order:
+
+1. `pyMatRad/userdata/machines/` — custom / site-specific machines (`.npy` or `.mat`)
+2. `matRad/matRad/basedata/` — original MATLAB machine files (`.mat`)
+
+Within each folder `.npy` (native Python) takes priority over `.mat`.
+
+The filename pattern is `{radiationMode}_{machineName}`, e.g. `photons_TrueBeam_6X.mat`.
 
 ---
 
