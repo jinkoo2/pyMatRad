@@ -542,14 +542,123 @@ def tune_energy(energy_name: str, opt_fields: list,
 
 
 # ---------------------------------------------------------------------------
+# Optional step 2: rebuild lateral kernels with tuned m / betas
+# ---------------------------------------------------------------------------
+
+def rebuild_kernels_with_tuned_params(energy_name: str, best_params: dict,
+                                      verbose: bool = True) -> dict:
+    """
+    Rebuild the 501 radial kernel tables for *energy_name* using the tuned
+    m and betas as **fixed** SVD basis functions.
+
+    Background
+    ----------
+    The lateral kernel weights W_ri are computed by projecting the GBD TPR
+    data onto three depth-dose basis functions:
+
+        phi_k(d) = β_k / (β_k − m) · (e^{−m·d} − e^{−β_k·d})
+
+    When m/betas are auto-derived from the TPR regression the fit is a
+    compromise across all depths.  Using the tuned values (from tune_machine.py)
+    as a **fixed** basis, then re-solving for W_ri, gives a better least-squares
+    match of the GBD TPR for every field size simultaneously — which is what
+    reduces the 3×3 vs 20×20 PDD discrepancy.
+
+    This is NOT circular: the GBD TPR (ground truth) is unchanged;
+    only the basis used to decompose it is improved.
+
+    What changes vs patching only
+    ------------------------------
+    patch only         kernel weights W_ri = original (fit with original m/β)
+                       depth-dose basis   = tuned m/β  (mismatch → field-size error)
+    rebuild + patch    kernel weights W_ri = re-fitted with tuned m/β as basis
+                       depth-dose basis   = tuned m/β  (consistent → best accuracy)
+
+    Parameters
+    ----------
+    energy_name  : str   e.g. "TrueBeam_6X"
+    best_params  : dict  keys: fwhm, m, beta1, beta2, beta3
+    verbose      : bool
+
+    Returns
+    -------
+    machine : dict  new machine with rebuilt kernels + tuned parameters
+    """
+    from matRad.machineBuilder import (
+        build_truebeam_machine,
+        read_output_factors,
+        read_depth_dose_tpr,
+        read_primary_fluence,
+        generate_machine,
+    )
+    from matRad.machineBuilder.build_truebeam import _CONFIGS
+
+    if energy_name not in _CONFIGS:
+        raise ValueError(f"No build config for '{energy_name}'. "
+                         f"Available: {sorted(_CONFIGS.keys())}")
+
+    cfg    = _CONFIGS[energy_name]
+    bd_dir = os.path.join(GBD_ROOT, cfg["gbd_subdir"])
+
+    if verbose:
+        print(f"\n  Rebuilding kernels for {energy_name} "
+              f"(m={best_params['m']:.6f}, "
+              f"betas=({best_params['beta1']:.5f}, "
+              f"{best_params['beta2']:.5f}, "
+              f"{best_params['beta3']:.5f})) …")
+
+    # Load original GBD commissioning data (unchanged — NOT from pyMatRad output)
+    of_mm, of_vals = read_output_factors(
+        os.path.join(bd_dir, "Open field Output Factors.csv"))
+    fs_mm, d_mm, tpr = read_depth_dose_tpr(
+        os.path.join(bd_dir, "Open Field Depth Dose.csv"),
+        ssd_mm=float(cfg["params"]["SAD"]))
+    pf_r, pf_vals = read_primary_fluence(
+        os.path.join(bd_dir, cfg["profile_file"]))
+
+    # Build params dict, overriding fwhm_gauss with the tuned value
+    params = dict(cfg["params"])
+    params["fwhm_gauss"] = best_params["fwhm"]
+
+    if verbose:
+        print(f"    Generating 501 SSD kernels with fixed m/betas …")
+
+    machine = generate_machine(
+        name               = energy_name,
+        params             = params,
+        tpr_field_sizes_mm = fs_mm,
+        tpr_depths_mm      = d_mm,
+        tpr                = tpr,
+        of_mm              = of_mm,
+        of_vals            = of_vals,
+        pf_r               = pf_r,
+        pf_vals            = pf_vals,
+        fixed_m            = best_params["m"],
+        fixed_betas        = np.array([best_params["beta1"],
+                                       best_params["beta2"],
+                                       best_params["beta3"]]),
+    )
+
+    if verbose:
+        print(f"    Kernel rebuild complete.")
+
+    return machine
+
+
+# ---------------------------------------------------------------------------
 # Save tuned machine + TG-51 calibration
 # ---------------------------------------------------------------------------
 
 def apply_and_calibrate(energy_name: str, best_params: dict,
+                        rebuild_kernels: bool = False,
                         plot_dir: str = None) -> dict:
     """
-    Patch the machine file with the tuned parameters and re-run TG-51
-    calibration.  Overwrites (or creates) ``userdata/machines/photons_{energy}.npy``.
+    Save the tuned machine and run TG-51 calibration.
+
+    If *rebuild_kernels* is True, the 501 radial kernel tables are
+    re-fitted to the GBD TPR using the tuned m/betas as a fixed basis
+    (see rebuild_kernels_with_tuned_params).  Otherwise only the scalar
+    parameters (m, betas, penumbraFWHMatIso) are patched.
 
     Returns the tg51 dict written to the machine.
     """
@@ -562,21 +671,22 @@ def apply_and_calibrate(energy_name: str, best_params: dict,
     _cm_spec.loader.exec_module(_cm)
     calibrate = _cm.calibrate
 
-    print(f"\n  Applying tuned parameters to {energy_name} …")
-
-    # Load original
-    pln_probe = {"radiationMode": "photons", "machine": energy_name}
-    machine   = load_machine(pln_probe)
-
-    # Patch
-    machine = _patch_machine(
-        machine,
-        fwhm  = best_params["fwhm"],
-        m     = best_params["m"],
-        betas = np.array([best_params["beta1"],
-                          best_params["beta2"],
-                          best_params["beta3"]]),
-    )
+    if rebuild_kernels:
+        print(f"\n  Rebuilding kernels + applying tuned parameters for {energy_name} …")
+        machine = rebuild_kernels_with_tuned_params(energy_name, best_params,
+                                                    verbose=True)
+    else:
+        print(f"\n  Patching tuned parameters into {energy_name} …")
+        pln_probe = {"radiationMode": "photons", "machine": energy_name}
+        machine   = load_machine(pln_probe)
+        machine   = _patch_machine(
+            machine,
+            fwhm  = best_params["fwhm"],
+            m     = best_params["m"],
+            betas = np.array([best_params["beta1"],
+                              best_params["beta2"],
+                              best_params["beta3"]]),
+        )
 
     # Save to userdata/machines/
     os.makedirs(USER_MACHINE_DIR, exist_ok=True)
@@ -777,11 +887,17 @@ def _build_parser():
                    help="Ignore existing checkpoints; re-run from scratch.")
     p.add_argument("--no-calibrate", action="store_true",
                    help="Skip TG-51 calibration step after tuning.")
+    p.add_argument("--rebuild-kernels", action="store_true",
+                   help="After tuning, rebuild the 501 radial kernel tables using "
+                        "the tuned m/betas as fixed SVD basis functions. "
+                        "This re-fits the lateral kernel weights W_ri to the GBD TPR "
+                        "and reduces field-size-dependent PDD errors (3×3 vs 20×20). "
+                        "Adds ~5–15 min per energy. Recommended for final production build.")
     p.add_argument("--plot-dir",  default=None, metavar="DIR",
                    help="Directory for before/after comparison plots.")
-    p.add_argument("--output-md", default=os.path.join(ROOT, "examples", "machine_tuning.md"),
+    p.add_argument("--output-md", default=os.path.join(ROOT, "examples", "tune_machine.md"),
                    metavar="FILE",
-                   help="Path for the markdown summary (default: examples/machine_tuning.md).")
+                   help="Path for the markdown summary (default: examples/tune_machine.md).")
     return p
 
 
@@ -801,6 +917,7 @@ def main():
     print(f"  Max iter    : {args.max_iter}")
     print(f"  Dry run     : {args.dry_run}")
     print(f"  Force       : {args.force}")
+    print(f"  Rebuild kern: {args.rebuild_kernels}")
     print(f"  Plot dir    : {args.plot_dir or '(none)'}")
 
     t_total = time.perf_counter()
@@ -856,9 +973,10 @@ def main():
             if not args.no_calibrate:
                 try:
                     tg51 = apply_and_calibrate(
-                        energy_name  = energy_name,
-                        best_params  = result["best_params"],
-                        plot_dir     = args.plot_dir,
+                        energy_name     = energy_name,
+                        best_params     = result["best_params"],
+                        rebuild_kernels = args.rebuild_kernels,
+                        plot_dir        = args.plot_dir,
                     )
                 except Exception as e:
                     print(f"\n  Warning: calibration failed: {e}")

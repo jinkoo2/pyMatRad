@@ -146,6 +146,8 @@ def generate_machine(
     of_vals: np.ndarray,
     pf_r: np.ndarray,
     pf_vals: np.ndarray,
+    fixed_m: float = None,
+    fixed_betas: np.ndarray = None,
 ) -> dict:
     """
     Generate a matRad-compatible photon machine dict from commissioning data.
@@ -168,10 +170,26 @@ def generate_machine(
     of_vals  : (K,)  – measured output factors
     pf_r     : (P,)  – primary fluence radial positions [mm]
     pf_vals  : (P,)  – primary fluence values (normalised to 1 at r=0)
+    fixed_m  : float, optional
+        If given, skip the log-linear TPR regression and use this value
+        directly as the attenuation coefficient µ [mm⁻¹].  Use the value
+        found by tune_machine.py to rebuild kernels with a better basis.
+    fixed_betas : (3,) array-like, optional
+        If given, skip the automatic beta computation and use these three
+        decay constants [mm⁻¹] directly.  Must be provided together with
+        fixed_m (or m is auto-derived while betas are fixed).
 
     Returns
     -------
     machine : dict  compatible with pyMatRad load_machine / photon_svd_engine
+
+    Notes
+    -----
+    When *fixed_m* / *fixed_betas* are supplied the kernel weights W_ri are
+    re-fitted to the **same GBD TPR data** but using the supplied values as
+    the SVD basis functions ``phi_k(d) = β_k/(β_k-µ)·(e^{-µd} - e^{-β_k·d})``.
+    Better basis → better least-squares fit across all field sizes → reduced
+    field-size-dependent PDD error (3×3 vs 20×20 undershoot).
     """
     SAD  = float(params["SAD"])
     fwhm = float(params["fwhm_gauss"])
@@ -199,38 +217,45 @@ def generate_machine(
 
     ix     = int(np.argmin(np.abs(tpr_depths_mm - mean_max_mm)))
     t_post = tpr_depths_mm[ix + 1:]
-    log_t  = -np.log(tpr_0[ix + 1:])
-    n_pts  = len(t_post)
 
-    fSx  = t_post.sum()
-    fSxx = (t_post ** 2).sum()
-    fSy  = log_t.sum()
-    fSxy = (log_t * t_post).sum()
-    mu   = (fSxy - fSx * fSy / n_pts) / (fSxx - fSx ** 2 / n_pts)
+    if fixed_m is not None:
+        mu = float(fixed_m)
+    else:
+        log_t  = -np.log(tpr_0[ix + 1:])
+        n_pts  = len(t_post)
+        fSx  = t_post.sum()
+        fSxx = (t_post ** 2).sum()
+        fSy  = log_t.sum()
+        fSxy = (log_t * t_post).sum()
+        mu   = (fSxy - fSx * fSy / n_pts) / (fSxx - fSx ** 2 / n_pts)
 
     # ------------------------------------------------------------------
     # Compute betas (Batho / Scholz exponential decomposition)
     # ------------------------------------------------------------------
-    def _max_pos(x, mu):
-        """Depth of maximum of  β/(β-µ) · (e^{-µd} - e^{-βd})."""
-        if abs(x - mu) < 1e-12:
-            return 1.0 / mu
-        return (np.log(mu) - np.log(x)) / (mu - x)
+    if fixed_betas is not None:
+        betas = np.asarray(fixed_betas, dtype=float).ravel()
+        assert len(betas) == 3, "fixed_betas must have exactly 3 elements"
+    else:
+        def _max_pos(x, mu):
+            """Depth of maximum of  β/(β-µ) · (e^{-µd} - e^{-βd})."""
+            if abs(x - mu) < 1e-12:
+                return 1.0 / mu
+            return (np.log(mu) - np.log(x)) / (mu - x)
 
-    targets = [
-        mean_max_mm,
-        (mean_max_mm + 1.0 / mu) / 2.0,
-        1.0 / mu,
-    ]
-    betas = []
-    for tgt in targets:
-        res = minimize_scalar(
-            lambda x: (_max_pos(x, mu) - tgt) ** 2,
-            bounds=(1e-6, 1000.0),
-            method="bounded",
-        )
-        betas.append(float(res.x))
-    betas = np.array(betas)
+        targets = [
+            mean_max_mm,
+            (mean_max_mm + 1.0 / mu) / 2.0,
+            1.0 / mu,
+        ]
+        betas = []
+        for tgt in targets:
+            res = minimize_scalar(
+                lambda x: (_max_pos(x, mu) - tgt) ** 2,
+                bounds=(1e-6, 1000.0),
+                method="bounded",
+            )
+            betas.append(float(res.x))
+        betas = np.array(betas)
 
     # ------------------------------------------------------------------
     # Kernel normalisation
