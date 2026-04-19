@@ -189,7 +189,7 @@ def calibrate(radiation_mode: str, machine_name: str,
     w = np.zeros(n_bixels_total, dtype=np.float64)
     col = 0
     for beam in stf:
-        for ray in beam["rays"]:
+        for ray in beam["ray"]:
             rp = np.asarray(ray["rayPos_bev"])
             if abs(rp[0]) <= half_field and abs(rp[2]) <= half_field:
                 w[col] = 1.0
